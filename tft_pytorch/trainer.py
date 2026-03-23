@@ -29,7 +29,7 @@ class TFTTrainer:
                  train_loader: DataLoader,
                  val_loader: DataLoader,
                  train_adapter,  # TFTDataAdapter or TCNDataAdapter
-                 val_adapater,
+                 val_adapter,
 
                  # Loss configuration
                  loss_type: str = 'quantile',
@@ -100,7 +100,7 @@ class TFTTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.train_adapter = train_adapter
-        self.val_adapter = val_adapater
+        self.val_adapter = val_adapter
 
         # Training configuration
         self.loss_type = loss_type
