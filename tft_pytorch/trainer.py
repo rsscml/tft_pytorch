@@ -1,665 +1,1028 @@
-"""
-Training and inference pipelines for Temporal Fusion Transformer models.
+#!/usr/bin/env python
+# coding: utf-8
 
-Classes
--------
-TFTTrainer
-    End-to-end training loop with configurable loss, optimizer, LR scheduler,
-    gradient clipping, mixed-precision, sample weighting, and checkpointing.
-TFTInference
-    Lightweight inference wrapper that loads a checkpoint and runs batch prediction.
-TFTInferenceWithTracking
-    Extended inference that returns a tidy DataFrame with entity IDs, timestamps,
-    predictions (with quantile columns), and actuals.
-"""
+# In[ ]:
 
-import logging
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
+#!/usr/bin/env python
+# coding: utf-8
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
+import numpy as np
+from pathlib import Path
+import json
+import logging
+from typing import Dict, Optional, Tuple, List
+from datetime import datetime
 
-from .losses import (
-    AdaptiveLoss,
-    CombinedLoss,
-    HuberLoss,
-    MAELoss,
-    MSELoss,
-    QuantileLoss,
-    TweedieLoss,
-)
-
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+
+# In[ ]:
+
+
 class TFTTrainer:
     """
-    Complete training pipeline for :class:`~tft_pytorch.models.TemporalFusionTransformer`
-    (and compatible encoder-only / TCN) models.
-
-    Parameters
-    ----------
-    model : nn.Module
-        TFT or TFTEncoderOnly model.
-    train_loader, val_loader : DataLoader
-        Must be created with the matching adapter's ``collate_fn``.
-    train_adapter, val_adapter : TFTDataAdapter
-        Used to convert collated batches to model inputs.
-    loss_type : str
-        One of ``'quantile'``, ``'mse'``, ``'mae'``, ``'huber'``, ``'tweedie'``,
-        ``'combined'``, ``'adaptive'``.
-    loss_params : dict, optional
-        Extra keyword arguments forwarded to the loss constructor.
-        For ``'quantile'``: ``{'quantiles': [0.1, 0.5, 0.9]}``.
-        For ``'huber'``:    ``{'delta': 1.0}``.
-        For ``'tweedie'``:  ``{'p': 1.5}``.
-        For ``'combined'`` / ``'adaptive'``:
-          ``{'losses': [{'type': 'quantile', 'params': {...}}, ...], 'weights': [...]}``
-    optimizer_type : str
-        ``'adam'`` | ``'adamw'`` | ``'sgd'``
-    learning_rate : float
-    weight_decay : float
-    momentum : float
-        Only used with SGD.
-    scheduler_type : str or None
-        ``'reduce_on_plateau'`` | ``'cosine'`` | ``None``
-    scheduler_factor, scheduler_patience : float / int
-        Parameters for ReduceLROnPlateau.
-    scheduler_t0, scheduler_t_mult : int
-        Parameters for CosineAnnealingWarmRestarts.
-    enable_gradient_clipping : bool
-    max_grad_norm : float
-    enable_train_sample_weighting : bool
-        Multiply per-sample loss by ``entity_weight * recency_weight`` during training.
-    enable_val_sample_weighting : bool
-        Same as above but for validation.
-    enable_mixed_precision : bool
-        Use ``torch.amp`` FP16 training (GPU only).
-    save_path : str
-        Directory for checkpoints.
-    save_every : int
-        Save a checkpoint every N epochs.
-    device : str, optional
-        Falls back to the model's own device attribute.
+    Complete training pipeline for Temporal Fusion Transformer models.
     """
+    
+    def __init__(self,
+                 model: nn.Module,
+                 train_loader: DataLoader,
+                 val_loader: DataLoader,
+                 train_adapter,  # TFTDataAdapter or TCNDataAdapter
+                 val_adapater,
 
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        train_adapter,
-        val_adapter,
-        loss_type: str = 'quantile',
-        loss_params: Optional[Dict] = None,
-        optimizer_type: str = 'adam',
-        learning_rate: float = 1e-3,
-        weight_decay: float = 1e-5,
-        momentum: float = 0.9,
-        scheduler_type: Optional[str] = 'reduce_on_plateau',
-        scheduler_factor: float = 0.5,
-        scheduler_patience: int = 10,
-        scheduler_t0: int = 10,
-        scheduler_t_mult: int = 2,
-        enable_gradient_clipping: bool = True,
-        max_grad_norm: float = 1.0,
-        enable_train_sample_weighting: bool = False,
-        enable_val_sample_weighting: bool = False,
-        enable_mixed_precision: bool = False,
-        save_path: str = './checkpoints',
-        save_every: int = 5,
-        device: Optional[str] = None,
-    ):
+                 # Loss configuration
+                 loss_type: str = 'quantile',
+                 loss_params: Optional[Dict] = None,
+                 
+                 # Optimizer configuration
+                 optimizer_type: str = 'adam',
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-5,
+                 momentum: float = 0.9,  # For SGD
+                 
+                 # Scheduler configuration
+                 scheduler_type: Optional[str] = 'reduce_on_plateau',
+                 scheduler_factor: float = 0.5,
+                 scheduler_patience: int = 10,
+                 scheduler_t0: int = 10,  # For cosine annealing
+                 scheduler_t_mult: int = 2,  # For cosine annealing
+                 
+                 # Training options
+                 enable_gradient_clipping: bool = True,
+                 max_grad_norm: float = 1.0,
+                 enable_train_sample_weighting: bool = False,
+                 enable_val_sample_weighting: bool = False,
+                 
+                 # Mixed precision training
+                 enable_mixed_precision: bool = False,
+                 
+                 # Checkpointing
+                 save_path: str = './checkpoints',
+                 save_every: int = 5,
+                 
+                 # Other
+                 device: Optional[str] = None):
+        """
+        Initialize TFT trainer with explicit parameters.
+        
+        Args:
+            model: TFT or TFTEncoderOnly model
+            train_loader: Training DataLoader
+            val_loader: Validation DataLoader
+            adapter: Data adapter (TFTDataAdapter or TCNDataAdapter)
+            
+            loss_type: Type of loss function ('quantile', 'mse', 'mae', 'huber', 'tweedie', 'combined', 'adaptive')
+            loss_params: Additional parameters for the loss function
+            
+            optimizer_type: Type of optimizer ('adam', 'adamw', 'sgd')
+            learning_rate: Learning rate
+            weight_decay: Weight decay for regularization
+            momentum: Momentum for SGD optimizer
+            
+            scheduler_type: Type of LR scheduler ('reduce_on_plateau', 'cosine', None)
+            scheduler_factor: Factor for ReduceLROnPlateau
+            scheduler_patience: Patience for ReduceLROnPlateau
+            scheduler_t0: T_0 for CosineAnnealingWarmRestarts
+            scheduler_t_mult: T_mult for CosineAnnealingWarmRestarts
+            
+            enable_gradient_clipping: Whether to apply gradient clipping
+            max_grad_norm: Maximum gradient norm for clipping
+            enable_train_sample_weighting: Whether to use sample weights in loss calculation in train loop
+            enable_val_sample_weighting: Whether to use sample weights in loss calculation in val loop
+            
+            save_path: Directory to save checkpoints
+            save_every: Save checkpoint every N epochs
+            
+            device: Device to use (if None, uses model's device)
+        """
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.train_adapter = train_adapter
-        self.val_adapter = val_adapter
+        self.val_adapter = val_adapater
 
+        # Training configuration
         self.loss_type = loss_type
         self.loss_params = loss_params or {}
+        
         self.optimizer_type = optimizer_type
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.momentum = momentum
+        
         self.scheduler_type = scheduler_type
         self.scheduler_factor = scheduler_factor
         self.scheduler_patience = scheduler_patience
         self.scheduler_t0 = scheduler_t0
         self.scheduler_t_mult = scheduler_t_mult
+        
         self.enable_gradient_clipping = enable_gradient_clipping
         self.max_grad_norm = max_grad_norm
         self.enable_train_sample_weighting = enable_train_sample_weighting
         self.enable_val_sample_weighting = enable_val_sample_weighting
+        
+        # Mixed precision training setup
         self.enable_mixed_precision = enable_mixed_precision
+        self.scaler = torch.amp.GradScaler(model.device) if enable_mixed_precision else None
+        
         self.save_every = save_every
+        
+        # Setup paths
         self.save_path = Path(save_path)
         self.save_path.mkdir(parents=True, exist_ok=True)
-        self.device = device or getattr(model, 'device', 'cpu')
-
+        
+        # Device
+        self.device = device or model.device
+        
         # Training state
         self.best_val_loss = float('inf')
         self.patience_counter = 0
         self.epoch = 0
-        self.train_losses: List[float] = []
-        self.val_losses: List[float] = []
-        self.metrics_history: Dict[str, List] = {}
-
-        # Mixed precision scaler
-        self.scaler = torch.amp.GradScaler(self.device) if enable_mixed_precision else None
-
-        self._setup_loss()
-        self._setup_optimizer()
-
-    # ------------------------------------------------------------------
-    # Setup helpers
-    # ------------------------------------------------------------------
-
-    def _setup_loss(self):
-        lp = self.loss_params
-
+        
+        # Setup loss function
+        self.setup_loss()
+        
+        # Setup optimizer and scheduler
+        self.setup_optimizer()
+        
+        # Initialize metrics tracking
+        self.train_losses = []
+        self.val_losses = []
+        self.metrics_history = {}
+        
+    def setup_loss(self):
+        """Setup loss function based on configuration."""
+        # Import loss functions
+        from TFT_Losses_Pytorch import (
+            QuantileLoss, MSELoss, MAELoss, HuberLoss, 
+            TweedieLoss, CombinedLoss, AdaptiveLoss
+        )
+        
         if self.loss_type == 'quantile':
-            self.criterion = QuantileLoss(quantiles=lp.get('quantiles', [0.1, 0.5, 0.9]))
+            self.criterion = QuantileLoss(
+                quantiles=self.loss_params.get('quantiles', [0.1, 0.5, 0.9]),
+                reduction='mean'
+            )
         elif self.loss_type == 'mse':
-            self.criterion = MSELoss()
+            self.criterion = MSELoss(reduction='mean')
         elif self.loss_type == 'mae':
-            self.criterion = MAELoss()
+            self.criterion = MAELoss(reduction='mean')
         elif self.loss_type == 'huber':
-            self.criterion = HuberLoss(delta=lp.get('delta', 1.0))
+            self.criterion = HuberLoss(
+                delta=self.loss_params.get('delta', 1.0),
+                reduction='mean'
+            )
         elif self.loss_type == 'tweedie':
-            self.criterion = TweedieLoss(p=lp.get('p', 1.5))
+            self.criterion = TweedieLoss(
+                p=self.loss_params.get('p', 1.5),
+                reduction='mean'
+            )
         elif self.loss_type == 'combined':
-            losses = [self._build_single_loss(s['type'], **s.get('params', {}))
-                      for s in lp.get('losses', [])]
-            self.criterion = CombinedLoss(losses, weights=lp.get('weights'),
-                                          learnable_weights=lp.get('learnable_weights', False))
+            # Use multiple losses
+            losses = []
+            for loss_spec in self.loss_params.get('losses', []):
+                loss_fn = self._get_loss_function(loss_spec['type'], **loss_spec.get('params', {}))
+                losses.append(loss_fn)
+            self.criterion = CombinedLoss(
+                losses=losses,
+                weights=self.loss_params.get('weights'),
+                learnable_weights=self.loss_params.get('learnable_weights', False)
+            )
         elif self.loss_type == 'adaptive':
-            losses = [self._build_single_loss(s['type'], **s.get('params', {}))
-                      for s in lp.get('losses', [])]
-            self.criterion = AdaptiveLoss(losses, ema_decay=lp.get('ema_decay', 0.99),
-                                          warmup_steps=lp.get('warmup_steps', 100))
+            # Adaptive multi-loss
+            losses = []
+            for loss_spec in self.loss_params.get('losses', []):
+                loss_fn = self._get_loss_function(loss_spec['type'], **loss_spec.get('params', {}))
+                losses.append(loss_fn)
+            self.criterion = AdaptiveLoss(
+                losses=losses,
+                ema_decay=self.loss_params.get('ema_decay', 0.99),
+                warmup_steps=self.loss_params.get('warmup_steps', 100)
+            )
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-    def _build_single_loss(self, loss_type: str, **kwargs) -> nn.Module:
-        mapping = {
+    
+    def _get_loss_function(self, loss_type: str, **kwargs):
+        """Helper to get loss function by type."""
+        from TFT_Loss_Functions import (
+            QuantileLoss, MSELoss, MAELoss, HuberLoss, TweedieLoss
+        )
+        
+        loss_map = {
             'quantile': QuantileLoss,
             'mse': MSELoss,
             'mae': MAELoss,
             'huber': HuberLoss,
             'tweedie': TweedieLoss,
         }
-        if loss_type not in mapping:
+        
+        if loss_type not in loss_map:
             raise ValueError(f"Unknown loss type: {loss_type}")
-        return mapping[loss_type](**kwargs)
-
-    def _setup_optimizer(self):
+        
+        return loss_map[loss_type](**kwargs)
+    
+    def setup_optimizer(self):
+        """Setup optimizer and learning rate scheduler."""
+        # Get optimizer
         if self.optimizer_type == 'adam':
-            self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate,
-                                        weight_decay=self.weight_decay)
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay
+            )
         elif self.optimizer_type == 'adamw':
-            self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate,
-                                         weight_decay=self.weight_decay)
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay
+            )
         elif self.optimizer_type == 'sgd':
-            self.optimizer = optim.SGD(self.model.parameters(), lr=self.learning_rate,
-                                       momentum=self.momentum, weight_decay=self.weight_decay)
+            self.optimizer = optim.SGD(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                momentum=self.momentum,
+                weight_decay=self.weight_decay
+            )
         else:
             raise ValueError(f"Unknown optimizer: {self.optimizer_type}")
-
+        
+        # Setup scheduler
         if self.scheduler_type == 'reduce_on_plateau':
-            self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min',
-                                               factor=self.scheduler_factor,
-                                               patience=self.scheduler_patience)
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=self.scheduler_factor,
+                patience=self.scheduler_patience,
+                verbose=True
+            )
         elif self.scheduler_type == 'cosine':
-            self.scheduler = CosineAnnealingWarmRestarts(self.optimizer,
-                                                         T_0=self.scheduler_t0,
-                                                         T_mult=self.scheduler_t_mult)
+            self.scheduler = CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=self.scheduler_t0,
+                T_mult=self.scheduler_t_mult
+            )
         else:
             self.scheduler = None
-
-    # ------------------------------------------------------------------
-    # Per-batch helpers
-    # ------------------------------------------------------------------
-
-    def _build_sample_weight(self, predictions: torch.Tensor, batch: Dict) -> Optional[torch.Tensor]:
-        bs = predictions.shape[0]
-        w = torch.ones(bs, dtype=torch.float32, device=self.device)
-        if 'entity_weight' in batch:
-            w = w * batch['entity_weight'].to(self.device)
-        if 'recency_weight' in batch:
-            w = w * batch['recency_weight'].to(self.device)
-        # Reshape for broadcasting
-        if predictions.dim() == 3:
-            w = w.unsqueeze(1).unsqueeze(2)
-        elif predictions.dim() == 2:
-            w = w.unsqueeze(1)
-        return w
-
-    def _forward_and_loss(self, model_inputs: Dict, batch: Dict,
-                          use_sample_weighting: bool) -> torch.Tensor:
-        outputs = self.model(
-            static_categorical=model_inputs.get('static_categorical'),
-            static_continuous=model_inputs.get('static_continuous'),
-            historical_categorical=model_inputs.get('historical_categorical'),
-            historical_continuous=model_inputs.get('historical_continuous'),
-            future_categorical=model_inputs.get('future_categorical'),
-            future_continuous=model_inputs.get('future_continuous'),
-            padding_mask=model_inputs.get('padding_mask'),
-        )
-
-        predictions = outputs['predictions']
-        targets = model_inputs['future_targets']
-
-        future_mask = batch['mask'][:, -self.model.prediction_steps:] if 'mask' in batch else None
-        loss_kwargs = {'mask': future_mask}
-
-        if use_sample_weighting:
-            loss_kwargs['sample_weight'] = self._build_sample_weight(predictions, batch)
-
-        if self.loss_type == 'tweedie':
-            win_idx = batch['window_idx'].tolist()
-            dataset = self.train_adapter.dataset
-            tgt_col = dataset.target_cols[0]
-            predictions = torch.clamp(dataset.inverse_transform_predictions(predictions, win_idx, tgt_col), min=0)
-            targets = torch.clamp(dataset.inverse_transform_predictions(targets, win_idx, tgt_col), min=0)
-
-        return self.criterion(predictions, targets, **loss_kwargs)
-
-    # ------------------------------------------------------------------
-    # Training / validation epochs
-    # ------------------------------------------------------------------
-
+    
     def train_epoch(self) -> float:
-        """Run one training epoch and return average loss."""
+        """Train for one epoch."""
         self.model.train()
-        total, count = 0.0, 0
-
+        total_loss = 0
+        num_batches = 0
+        
         for batch_idx, batch in enumerate(self.train_loader):
-            batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            # Move batch to device
+            batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                    for k, v in batch.items()}
+            
+            # Adapt batch for model
             model_inputs = self.train_adapter.adapt_for_tft(batch)
+            
+            with torch.amp.autocast(device_type=self.device, dtype=torch.float16, enabled=self.enable_mixed_precision):
+                # Forward pass
+                outputs = self.model(static_categorical = model_inputs.get('static_categorical', None),
+                                     static_continuous = model_inputs.get('static_continuous', None),
+                                     historical_categorical = model_inputs.get('historical_categorical', None),
+                                     historical_continuous = model_inputs.get('historical_continuous', None),
+                                     future_categorical = model_inputs.get('future_categorical', None),
+                                     future_continuous = model_inputs.get('future_continuous', None),
+                                     padding_mask = model_inputs.get('padding_mask', None)
+                                    )
 
-            with torch.amp.autocast(device_type=self.device, dtype=torch.float16,
-                                    enabled=self.enable_mixed_precision):
-                loss = self._forward_and_loss(model_inputs, batch, self.enable_train_sample_weighting)
+                # Calculate loss
+                predictions = outputs['predictions']
+                targets = model_inputs['future_targets']
 
+                #print(f"predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+
+                # Get mask for future timesteps
+                if 'mask' in batch:
+                    future_mask = batch['mask'][:, -self.model.prediction_steps:]
+                    #print(f"mask shape: {future_mask.shape}")
+                else:
+                    future_mask = None
+
+                # Prepare loss kwargs
+                loss_kwargs = {
+                    'mask': future_mask
+                }
+
+                # Add sample weights if enabled
+                #if self.enable_sample_weighting and 'recency_weight' in batch:
+                #    loss_kwargs['sample_weight'] = batch['recency_weight']
+
+                # Combine entity and recency weights
+                if self.enable_train_sample_weighting:
+                    batch_size = predictions.shape[0]
+                    combined_weight = torch.ones(batch_size, dtype=torch.float32).to(self.device)
+
+                    # Apply entity weight
+                    if 'entity_weight' in batch:
+                        combined_weight = combined_weight * batch['entity_weight']
+
+                    # Apply recency weight
+                    if 'recency_weight' in batch:
+                        combined_weight = combined_weight * batch['recency_weight']
+
+                    # Reshape for broadcasting
+                    if predictions.dim() == 3:
+                        # [batch] -> [batch, 1, 1] for [batch, time, features]
+                        combined_weight = combined_weight.unsqueeze(1).unsqueeze(2)
+                    elif predictions.dim() == 2:
+                        # [batch] -> [batch, 1] for [batch, features]
+                        combined_weight = combined_weight.unsqueeze(1)
+
+                    loss_kwargs['sample_weight'] = combined_weight
+
+                # Special handling for TweedieLoss
+                if self.loss_type == 'tweedie':
+                    # Inverse transform both predictions and targets
+                    window_indices = batch['window_idx'].tolist()
+
+                    predictions_original = self.train_adapter.dataset.inverse_transform_predictions(
+                        predictions, window_indices, target_col=self.train_adapter.dataset.target_cols[0]
+                    )
+                    targets_original = self.train_adapter.dataset.inverse_transform_predictions(
+                        targets, window_indices, target_col=self.train_adapter.dataset.target_cols[0]
+                    )
+
+                    # Ensure non-negative (clip at 0 for safety)
+                    predictions_original = torch.clamp(predictions_original, min=0)
+                    targets_original = torch.clamp(targets_original, min=0)
+
+                    # Calculate loss with mask and weights
+                    loss = self.criterion(predictions_original, targets_original, **loss_kwargs)
+                else:
+                    # Compute loss
+                    loss = self.criterion(predictions, targets, **loss_kwargs)
+                    
+            # Backward pass
             self.optimizer.zero_grad()
+            
             if self.enable_mixed_precision:
+                # Scale loss and backward pass
                 self.scaler.scale(loss).backward()
+
+                # Gradient clipping if enabled (with unscaling)
                 if self.enable_gradient_clipping:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                # Optimizer step with scaler
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
+                # Standard backward pass
                 loss.backward()
+
+                # Gradient clipping if enabled
                 if self.enable_gradient_clipping:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                # Optimizer step
                 self.optimizer.step()
-
-            total += loss.item()
-            count += 1
-
+            
+            # Track loss
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Log progress
             if batch_idx % 100 == 0:
-                logger.info(f"  Batch {batch_idx}/{len(self.train_loader)}  loss={loss.item():.4f}")
-
-        return total / count
-
+                logger.info(f"Batch {batch_idx}/{len(self.train_loader)}, "
+                          f"Loss: {loss.item():.4f}")
+        
+        avg_loss = total_loss / num_batches
+        return avg_loss
+    
     @torch.no_grad()
     def validate(self) -> Tuple[float, Dict]:
-        """Run validation and return (avg_loss, metrics_dict)."""
+        """Validate the model."""
         self.model.eval()
-        total, count = 0.0, 0
-        all_preds, all_targets = [], []
-
+        total_loss = 0
+        num_batches = 0
+        
+        # Additional metrics
+        all_predictions = []
+        all_targets = []
+        all_masks = []
+        
         for batch in self.val_loader:
-            batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            # Move to device
+            batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                    for k, v in batch.items()}
+            
+            # Adapt batch
             model_inputs = self.val_adapter.adapt_for_tft(batch)
+            
+            # Forward pass with mixed precision if enabled
+            with torch.amp.autocast(device_type=self.device, dtype=torch.float16, enabled=self.enable_mixed_precision):
+                outputs = self.model(static_categorical = model_inputs.get('static_categorical', None),
+                                     static_continuous = model_inputs.get('static_continuous', None),
+                                     historical_categorical = model_inputs.get('historical_categorical', None),
+                                     historical_continuous = model_inputs.get('historical_continuous', None),
+                                     future_categorical = model_inputs.get('future_categorical', None),
+                                     future_continuous = model_inputs.get('future_continuous', None),
+                                     padding_mask = model_inputs.get('padding_mask', None)
+                                    )
 
-            with torch.amp.autocast(device_type=self.device, dtype=torch.float16,
-                                    enabled=self.enable_mixed_precision):
-                outputs = self.model(
-                    static_categorical=model_inputs.get('static_categorical'),
-                    static_continuous=model_inputs.get('static_continuous'),
-                    historical_categorical=model_inputs.get('historical_categorical'),
-                    historical_continuous=model_inputs.get('historical_continuous'),
-                    future_categorical=model_inputs.get('future_categorical'),
-                    future_continuous=model_inputs.get('future_continuous'),
-                    padding_mask=model_inputs.get('padding_mask'),
-                )
+                # Calculate loss
                 predictions = outputs['predictions']
                 targets = model_inputs['future_targets']
-                future_mask = batch['mask'][:, -self.model.prediction_steps:] if 'mask' in batch else None
+
+                if 'mask' in batch:
+                    future_mask = batch['mask'][:, -self.model.prediction_steps:]
+                else:
+                    future_mask = None
+
                 loss_kwargs = {'mask': future_mask}
+
+                # Combine entity and recency weights
+                combined_weight = None
                 if self.enable_val_sample_weighting:
-                    loss_kwargs['sample_weight'] = self._build_sample_weight(predictions, batch)
+                    batch_size = predictions.shape[0]
+                    combined_weight = torch.ones(batch_size, dtype=torch.float32).to(self.device)
 
+                    # Apply entity weight
+                    if 'entity_weight' in batch:
+                        entity_weight = batch['entity_weight']
+                        combined_weight = combined_weight * entity_weight
+
+                    # Apply recency weight
+                    if 'recency_weight' in batch:
+                        recency_weight = batch['recency_weight']
+                        combined_weight = combined_weight * recency_weight
+
+                    # Store original shape for metrics
+                    combined_weight_1d = combined_weight.clone()
+
+                    # Reshape for broadcasting in loss calculation
+                    if predictions.dim() == 3:
+                        combined_weight = combined_weight.unsqueeze(1).unsqueeze(2)
+                    elif predictions.dim() == 2:
+                        combined_weight = combined_weight.unsqueeze(1)
+
+                    loss_kwargs['sample_weight'] = combined_weight
+
+                # Special handling for TweedieLoss
                 if self.loss_type == 'tweedie':
-                    win_idx = batch['window_idx'].tolist()
-                    dataset = self.val_adapter.dataset
-                    tgt_col = dataset.target_cols[0]
-                    predictions = torch.clamp(
-                        dataset.inverse_transform_predictions(predictions, win_idx, tgt_col), min=0)
-                    targets = torch.clamp(
-                        dataset.inverse_transform_predictions(targets, win_idx, tgt_col), min=0)
+                    # Inverse transform both predictions and targets
+                    window_indices = batch['window_idx'].tolist()
 
-                loss = self.criterion(predictions, targets, **loss_kwargs)
+                    predictions_original = self.val_adapter.dataset.inverse_transform_predictions(
+                        predictions, window_indices, target_col=self.val_adapter.dataset.target_cols[0]
+                    )
+                    targets_original = self.val_adapter.dataset.inverse_transform_predictions(
+                        targets, window_indices, target_col=self.val_adapter.dataset.target_cols[0]
+                    )
 
-            total += loss.item()
-            count += 1
-            all_preds.append(predictions.cpu())
+                    # Ensure non-negative (clip at 0 for safety)
+                    predictions_original = torch.clamp(predictions_original, min=0)
+                    targets_original = torch.clamp(targets_original, min=0)
+
+                    # Calculate loss with mask and weights
+                    loss = self.criterion(predictions_original, targets_original, **loss_kwargs)
+                else:
+                    loss = self.criterion(predictions, targets, **loss_kwargs)
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Store for metrics calculation
+            all_predictions.append(predictions.cpu())
             all_targets.append(targets.cpu())
-
-        avg_loss = total / count
-        metrics = self.calculate_metrics(torch.cat(all_preds), torch.cat(all_targets))
+            if future_mask is not None:
+                all_masks.append(future_mask.cpu())
+            
+        avg_loss = total_loss / num_batches
+        
+        # Calculate additional metrics
+        all_predictions = torch.cat(all_predictions, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        
+        metrics = self.calculate_metrics(all_predictions, all_targets)
         metrics['val_loss'] = avg_loss
+        
         return avg_loss, metrics
-
-    def calculate_metrics(self, predictions: torch.Tensor, targets: torch.Tensor) -> Dict:
-        """Compute MSE, RMSE, MAE, and MAPE from point predictions."""
+    
+    def calculate_metrics(self, predictions: torch.Tensor, 
+                         targets: torch.Tensor) -> Dict:
+        """Calculate evaluation metrics."""
         import torch.nn.functional as F
-
+        
+        metrics = {}
+        
+        # For quantile predictions, use median (usually index 1 for [0.1, 0.5, 0.9])
         if predictions.dim() == 3 and predictions.size(-1) > 1:
-            p = predictions[..., predictions.size(-1) // 2]
+            # Use median quantile for point estimates
+            median_idx = predictions.size(-1) // 2
+            point_predictions = predictions[..., median_idx]
         else:
-            p = predictions.squeeze(-1)
+            point_predictions = predictions.squeeze(-1)
+        
         if targets.dim() == 3:
             targets = targets.squeeze(-1)
-
-        mse = F.mse_loss(p, targets).item()
-        mae = F.l1_loss(p, targets).item()
-        metrics = {'mse': mse, 'rmse': float(np.sqrt(mse)), 'mae': mae}
-
+        
+        # MSE
+        mse = F.mse_loss(point_predictions, targets).item()
+        metrics['mse'] = mse
+        metrics['rmse'] = np.sqrt(mse)
+        
+        # MAE
+        mae = F.l1_loss(point_predictions, targets).item()
+        metrics['mae'] = mae
+        
+        # MAPE (if targets are not too close to zero)
         mask = torch.abs(targets) > 0.1
         if mask.any():
-            mape = (torch.abs((targets - p) / targets) * mask).sum() / mask.sum()
-            metrics['mape'] = float(mape.item() * 100)
-
+            mape = (torch.abs((targets - point_predictions) / targets) * mask).sum() / mask.sum()
+            metrics['mape'] = mape.item() * 100
+        
         return metrics
-
-    # ------------------------------------------------------------------
-    # Checkpointing
-    # ------------------------------------------------------------------
-
+    
     def save_checkpoint(self, is_best: bool = False):
-        """Save training state to disk."""
-        ckpt = {
+        """Save model checkpoint."""
+        checkpoint = {
             'epoch': self.epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None, 
             'best_val_loss': self.best_val_loss,
             'training_params': {
                 'loss_type': self.loss_type,
                 'optimizer_type': self.optimizer_type,
                 'learning_rate': self.learning_rate,
+                'weight_decay': self.weight_decay,
+                'enable_gradient_clipping': self.enable_gradient_clipping,
+                'max_grad_norm': self.max_grad_norm,
+                'enable_train_sample_weighting': self.enable_train_sample_weighting,
+                'enable_val_sample_weighting': self.enable_val_sample_weighting,
+                'enable_mixed_precision': self.enable_mixed_precision
             },
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'metrics_history': self.metrics_history,
+            'metrics_history': self.metrics_history
         }
-        path = self.save_path / f'checkpoint_epoch_{self.epoch}.pt'
-        torch.save(ckpt, path)
-        logger.info(f"Saved checkpoint → {path}")
-
+        
+        # Save regular checkpoint
+        checkpoint_path = self.save_path / f'checkpoint_epoch_{self.epoch}.pt'
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Saved checkpoint to {checkpoint_path}")
+        
+        # Save best model
         if is_best:
             best_path = self.save_path / 'best_model.pt'
-            torch.save(ckpt, best_path)
-            torch.save(self.model.state_dict(), self.save_path / 'best_model_weights.pt')
-            logger.info(f"Saved best model → {best_path}")
-
+            torch.save(checkpoint, best_path)
+            logger.info(f"Saved best model to {best_path}")
+            
+            # Also save just the model for easier inference
+            model_only_path = self.save_path / 'best_model_weights.pt'
+            torch.save(self.model.state_dict(), model_only_path)
+    
     def load_checkpoint(self, checkpoint_path: str):
-        """Restore training state from a checkpoint file."""
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(ckpt['model_state_dict'])
-        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if self.scheduler and ckpt.get('scheduler_state_dict'):
-            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        if self.scaler and ckpt.get('scaler_state_dict'):
-            self.scaler.load_state_dict(ckpt['scaler_state_dict'])
-        self.epoch = ckpt['epoch']
-        self.best_val_loss = ckpt['best_val_loss']
-        self.train_losses = ckpt.get('train_losses', [])
-        self.val_losses = ckpt.get('val_losses', [])
-        self.metrics_history = ckpt.get('metrics_history', {})
+        """Load model from checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if self.scheduler and checkpoint['scheduler_state_dict']:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Load scaler state if available and mixed precision is enabled
+        if self.scaler and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict']:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        self.epoch = checkpoint['epoch']
+        self.best_val_loss = checkpoint['best_val_loss']
+        self.train_losses = checkpoint.get('train_losses', [])
+        self.val_losses = checkpoint.get('val_losses', [])
+        self.metrics_history = checkpoint.get('metrics_history', {})
+        
         logger.info(f"Loaded checkpoint from epoch {self.epoch}")
-
-    # ------------------------------------------------------------------
-    # Main training loop
-    # ------------------------------------------------------------------
-
+    
     def train(self, num_epochs: int, patience: int = 20):
-        """
-        Full training loop with early stopping.
-
-        Parameters
-        ----------
-        num_epochs : int
-            Maximum number of epochs.
-        patience : int
-            Stop training after this many epochs without improvement.
-        """
+        """Main training loop."""
         logger.info(f"Starting training for {num_epochs} epochs...")
-
+        
+        # Training loop
         for epoch in range(num_epochs):
             self.epoch = epoch + 1
             logger.info(f"\nEpoch {self.epoch}/{num_epochs}")
-
+            
+            # Train
             train_loss = self.train_epoch()
             self.train_losses.append(train_loss)
             logger.info(f"Train Loss: {train_loss:.4f}")
-
+            
+            # Validate
             val_loss, metrics = self.validate()
             self.val_losses.append(val_loss)
-            logger.info(f"Val Loss: {val_loss:.4f}  Metrics: {metrics}")
-
-            for k, v in metrics.items():
-                self.metrics_history.setdefault(k, []).append(v)
-
-            # LR scheduler step
+            logger.info(f"Val Loss: {val_loss:.4f}, Metrics: {metrics}")
+            
+            # Store metrics
+            for key, value in metrics.items():
+                if key not in self.metrics_history:
+                    self.metrics_history[key] = []
+                self.metrics_history[key].append(value)
+            
+            # Learning rate scheduling
             if self.scheduler:
                 if isinstance(self.scheduler, ReduceLROnPlateau):
                     self.scheduler.step(val_loss)
                 else:
                     self.scheduler.step()
-
-            # Early stopping
+            
+            # Check for improvement
             is_best = val_loss < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
-                logger.info(f"New best val loss: {val_loss:.4f}")
+                logger.info(f"New best validation loss: {val_loss:.4f}")
             else:
                 self.patience_counter += 1
-
+            
+            # Save checkpoint
             if self.epoch % self.save_every == 0 or is_best:
                 self.save_checkpoint(is_best=is_best)
-
+            
+            # Early stopping
             if self.patience_counter >= patience:
                 logger.info(f"Early stopping triggered after {self.epoch} epochs")
                 break
-
+        
         logger.info("Training completed!")
 
 
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-
 class TFTInference:
     """
-    Minimal inference wrapper.
-
-    Loads model weights from a ``.pt`` checkpoint and provides :meth:`predict_batch`
-    for running on a DataLoader.
-
-    Parameters
-    ----------
-    model_path : str
-        Path to a ``best_model.pt`` or ``best_model_weights.pt`` file.
-    model : nn.Module
-        An initialised model with the *same architecture* as during training.
-    adapter : TFTDataAdapter
-        The adapter used to convert batches into model inputs.
-    device : str
+    Inference pipeline for trained TFT models.
     """
-
-    def __init__(self, model_path: str, model: nn.Module, adapter, device: str = 'cuda'):
+    
+    def __init__(self, 
+                 model_path: str,
+                 model: nn.Module,
+                 adapter,
+                 device: str = 'cuda'):
+        """
+        Initialize inference pipeline.
+        
+        Args:
+            model_path: Path to saved model checkpoint
+            model: Initialized model architecture (must match training)
+            adapter: Data adapter (must match training setup)
+            device: Device to run inference on
+        """
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.model_path = Path(model_path)
         self.model = model
         self.adapter = adapter
-        self._load_weights()
-
-    def _load_weights(self):
-        ckpt = torch.load(self.model_path, map_location=self.device)
-        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-            self.model.load_state_dict(ckpt['model_state_dict'])
-        else:
-            self.model.load_state_dict(ckpt)
-        self.model.to(self.device).eval()
-        logger.info(f"Loaded model weights from {self.model_path}")
-
+        
+        # Load weights
+        self.load_model_weights()
+    
+    def load_model_weights(self):
+        """Load trained model weights."""
+        if self.model_path.suffix == '.pt':
+            checkpoint = torch.load(self.model_path, map_location=self.device)
+            if 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                # Assume it's just the state dict
+                self.model.load_state_dict(checkpoint)
+        
+        self.model.to(self.device)
+        self.model.eval()
+        logger.info(f"Loaded model from {self.model_path}")
+    
     @torch.no_grad()
-    def predict_batch(self, dataloader: DataLoader) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def predict_batch(self, dataloader) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Run inference on a DataLoader.
-
-        Returns
-        -------
-        predictions : np.ndarray  [N, prediction_steps, num_outputs]
-        targets     : np.ndarray or None
+        Run inference on a dataloader.
+        
+        Returns:
+            predictions: Model predictions
+            targets: Actual targets (if available)
         """
         self.model.eval()
-        all_preds, all_targets = [], []
-
+        
+        all_predictions = []
+        all_targets = []
+        all_window_indices = []
+        
         for batch in dataloader:
-            batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            mi = self.adapter.adapt_for_tft(batch)
-            outputs = self.model(
-                static_categorical=mi.get('static_categorical'),
-                static_continuous=mi.get('static_continuous'),
-                historical_categorical=mi.get('historical_categorical'),
-                historical_continuous=mi.get('historical_continuous'),
-                future_categorical=mi.get('future_categorical'),
-                future_continuous=mi.get('future_continuous'),
-                padding_mask=mi.get('padding_mask'),
-            )
-            all_preds.append(outputs['predictions'].cpu())
-            if mi.get('future_targets') is not None:
-                all_targets.append(mi['future_targets'].cpu())
-
-        preds = torch.cat(all_preds).numpy()
-        targets = torch.cat(all_targets).numpy() if all_targets else None
-        return preds, targets
+            batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                    for k, v in batch.items()}
+            
+            # Adapt batch
+            model_inputs = self.adapter.adapt_for_tft(batch)
+            
+            # Forward pass
+            outputs = self.model(static_categorical = model_inputs.get('static_categorical', None),
+                                 static_continuous = model_inputs.get('static_continuous', None),
+                                 historical_categorical = model_inputs.get('historical_categorical', None),
+                                 historical_continuous = model_inputs.get('historical_continuous', None),
+                                 future_categorical = model_inputs.get('future_categorical', None),
+                                 future_continuous = model_inputs.get('future_continuous', None),
+                                 padding_mask = model_inputs.get('padding_mask', None)
+                                )
+            predictions = outputs['predictions']
+            
+            # Store predictions and indices
+            all_predictions.append(predictions.cpu())
+            if 'window_idx' in batch:
+                all_window_indices.extend(batch['window_idx'].cpu().tolist())
+            
+            if 'future_targets' in model_inputs and model_inputs['future_targets'] is not None:
+                all_targets.append(model_inputs['future_targets'].cpu())
+        
+        # Concatenate all predictions
+        all_predictions = torch.cat(all_predictions, dim=0)
+        predictions_np = all_predictions.numpy()
+        
+        # Process targets if available
+        targets_np = None
+        if all_targets:
+            all_targets = torch.cat(all_targets, dim=0)
+            targets_np = all_targets.numpy()
+        
+        return predictions_np, targets_np
 
 
 class TFTInferenceWithTracking(TFTInference):
     """
-    Enhanced inference pipeline that returns a DataFrame with predictions,
-    actuals, entity IDs, and timestamps.
-
-    Inherits from :class:`TFTInference`.
+    Enhanced inference pipeline that tracks entity IDs and timestamps.
     """
-
+    
     @torch.no_grad()
-    def predict_with_metadata(self, dataloader: DataLoader) -> pd.DataFrame:
+    def predict_with_metadata(self, dataloader) -> pd.DataFrame:
         """
-        Run inference and return a tidy DataFrame.
-
-        Columns
-        -------
-        ``entity_id``, ``timestamp``, ``window_idx``, ``horizon`` (1-indexed),
-        ``pred_q10`` / ``pred_q50`` / ``pred_q90`` (for 3-quantile models) or
-        ``pred_0`` … ``pred_N``, ``actual_<target_col>`` (when targets available).
-
-        Returns
-        -------
-        pd.DataFrame  sorted by (entity_id, timestamp)
+        Run inference and return a DataFrame with predictions, actuals, entity IDs, and timestamps.
+        
+        Returns:
+            DataFrame with columns: entity_id, timestamp, prediction_*, actual_*, ...
         """
         self.model.eval()
-        records = []
-
+        
+        all_results = []
+        
         for batch in dataloader:
-            batch_gpu = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            mi = self.adapter.adapt_for_tft(batch_gpu)
-
+            batch_gpu = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                        for k, v in batch.items()}
+            
+            # Adapt batch
+            model_inputs = self.adapter.adapt_for_tft(batch_gpu)
+            
+            # Forward pass
             outputs = self.model(
-                static_categorical=mi.get('static_categorical'),
-                static_continuous=mi.get('static_continuous'),
-                historical_categorical=mi.get('historical_categorical'),
-                historical_continuous=mi.get('historical_continuous'),
-                future_categorical=mi.get('future_categorical'),
-                future_continuous=mi.get('future_continuous'),
-                padding_mask=mi.get('padding_mask'),
+                static_categorical=model_inputs.get('static_categorical', None),
+                static_continuous=model_inputs.get('static_continuous', None),
+                historical_categorical=model_inputs.get('historical_categorical', None),
+                historical_continuous=model_inputs.get('historical_continuous', None),
+                future_categorical=model_inputs.get('future_categorical', None),
+                future_continuous=model_inputs.get('future_continuous', None),
+                padding_mask=model_inputs.get('padding_mask', None)
             )
-
-            preds = outputs['predictions'].cpu().numpy()
-            actuals = mi['future_targets'].cpu().numpy() if mi.get('future_targets') is not None else None
-            entity_ids = batch['entity_id']
+            
+            predictions = outputs['predictions'].cpu().numpy()
+            
+            # Get actuals if available
+            actuals = None
+            if 'future_targets' in model_inputs and model_inputs['future_targets'] is not None:
+                actuals = model_inputs['future_targets'].cpu().numpy()
+            
+            # Get metadata from batch
+            entity_ids = batch['entity_id']  # List of entity IDs
             window_indices = batch['window_idx'].cpu().numpy()
-
+            
+            # Process each sample in batch
             for i in range(len(entity_ids)):
-                eid = entity_ids[i]
-                widx = int(window_indices[i])
-                future_ts = self.adapter.dataset.get_future_timestamps(widx)
-
-                pred = self._maybe_inverse(preds[i], widx)
-                act = self._maybe_inverse(actuals[i], widx) if actuals is not None else None
-
-                for t, ts in enumerate(future_ts):
-                    rec: Dict = {
-                        'entity_id': eid,
-                        'timestamp': ts,
-                        'window_idx': widx,
-                        'horizon': t + 1,
-                    }
-                    if pred.ndim == 2:
-                        if pred.shape[1] == 3:
-                            rec.update({'pred_q10': pred[t, 0], 'pred_q50': pred[t, 1], 'pred_q90': pred[t, 2]})
-                        else:
-                            for q in range(pred.shape[1]):
-                                rec[f'pred_{q}'] = pred[t, q]
+                entity_id = entity_ids[i]
+                window_idx = window_indices[i]
+                
+                # Get timestamps for this window
+                future_timestamps = self.adapter.dataset.get_future_timestamps(window_idx)
+                
+                # Inverse transform predictions if needed
+                pred_sample = predictions[i]  # Shape: [prediction_steps, num_outputs]
+                
+                if self.adapter.dataset.scaling_method != 'none':
+                    # Inverse transform for each target
+                    pred_original = np.zeros_like(pred_sample)
+                    for target_idx, target_col in enumerate(self.adapter.dataset.target_cols):
+                        if target_idx < pred_sample.shape[-1]:
+                            pred_original[:, target_idx] = self._inverse_transform_single(
+                                pred_sample[:, target_idx],
+                                window_idx,
+                                target_col
+                            )
+                else:
+                    pred_original = pred_sample
+                
+                # Process actuals if available
+                actual_original = None
+                if actuals is not None:
+                    actual_sample = actuals[i]
+                    if self.adapter.dataset.scaling_method != 'none':
+                        actual_original = np.zeros_like(actual_sample)
+                        for target_idx, target_col in enumerate(self.adapter.dataset.target_cols):
+                            if target_idx < actual_sample.shape[-1]:
+                                actual_original[:, target_idx] = self._inverse_transform_single(
+                                    actual_sample[:, target_idx],
+                                    window_idx,
+                                    target_col
+                                )
                     else:
-                        rec['prediction'] = pred[t]
-
-                    if act is not None:
-                        if act.ndim == 2:
-                            for qi, tgt_col in enumerate(self.adapter.dataset.target_cols):
-                                if qi < act.shape[1]:
-                                    rec[f'actual_{tgt_col}'] = act[t, qi]
+                        actual_original = actual_sample
+                
+                # Create records for each timestamp
+                for t, timestamp in enumerate(future_timestamps):
+                    record = {
+                        'entity_id': entity_id,
+                        'timestamp': timestamp,
+                        'window_idx': window_idx,
+                        'horizon': t + 1  # 1-indexed horizon
+                    }
+                    
+                    # Add predictions (handle multiple outputs/quantiles)
+                    if pred_original.ndim == 2:
+                        if pred_original.shape[1] == 3:  # Assuming quantiles
+                            record['pred_q10'] = pred_original[t, 0]
+                            record['pred_q50'] = pred_original[t, 1]
+                            record['pred_q90'] = pred_original[t, 2]
                         else:
-                            rec['actual'] = act[t]
-
-                    records.append(rec)
-
-        df = pd.DataFrame(records)
-        return df.sort_values(['entity_id', 'timestamp']).reset_index(drop=True)
-
-    def _maybe_inverse(self, values: np.ndarray, window_idx: int) -> np.ndarray:
-        """Inverse-transform predictions / actuals if scaling is enabled."""
+                            for q in range(pred_original.shape[1]):
+                                record[f'pred_{q}'] = pred_original[t, q]
+                    else:
+                        record['prediction'] = pred_original[t]
+                    
+                    # Add actuals if available
+                    if actual_original is not None:
+                        if actual_original.ndim == 2:
+                            for target_idx, target_col in enumerate(self.adapter.dataset.target_cols):
+                                if target_idx < actual_original.shape[1]:
+                                    record[f'actual_{target_col}'] = actual_original[t, target_idx]
+                        else:
+                            record['actual'] = actual_original[t]
+                    
+                    all_results.append(record)
+        
+        # Convert to DataFrame
+        results_df = pd.DataFrame(all_results)
+        
+        # Sort by entity and timestamp
+        results_df = results_df.sort_values(['entity_id', 'timestamp'])
+        
+        return results_df
+    
+    def _inverse_transform_single(self, values, window_idx, target_col):
+        """
+        Inverse transform a single target column.
+        """
         dataset = self.adapter.dataset
-        if dataset.scaling_method == 'none':
+        col_idx = dataset.feature_to_idx.get(target_col)
+        
+        if col_idx is None:
             return values
-        out = np.zeros_like(values)
-        for ti, tgt_col in enumerate(dataset.target_cols):
-            cidx = dataset.feature_to_idx.get(tgt_col)
-            if cidx is None:
-                out[:, ti] = values[:, ti] if values.ndim == 2 else values
-                continue
-            v = values[:, ti] if values.ndim == 2 else values
-            if dataset.scaling_method == 'mean':
-                out[:, ti] = v * dataset.scaler_params[window_idx, cidx]
-            else:
-                mean = dataset.scaler_params[window_idx, cidx, 0]
-                std = dataset.scaler_params[window_idx, cidx, 1]
-                out[:, ti] = v * std + mean
-        return out
+        
+        if dataset.scaling_method == 'mean':
+            scale = dataset.scaler_params[window_idx, col_idx]
+            return values * scale
+        elif dataset.scaling_method == 'standard':
+            mean = dataset.scaler_params[window_idx, col_idx, 0]
+            std = dataset.scaler_params[window_idx, col_idx, 1]
+            return values * std + mean
+        
+        return values
+    
+
+
+# In[ ]:
+
+
+"""
+# Example usage
+def main():
+    #Example training and inference pipeline
+    
+    # Import necessary modules
+    from TFT_Dataset_Optimized_Latest import (
+        OptimizedTFTDataset, create_tft_dataloader
+    )
+    from Transformer_TFT_Models import TemporalFusionTransformer
+    
+    # Create your dataset
+    dataset_config = {
+        'data_source': 'path/to/data.csv',
+        'features_config': {
+            'entity_col': 'store_id',
+            'time_index_col': 'date',
+            'target_col': 'sales',
+            'temporal_known_numeric_col_list': ['temperature', 'price'],
+            'temporal_known_categorical_col_list': ['day_of_week'],
+            # ... more features
+        },
+        'historical_steps': 30,
+        'prediction_steps': 7,
+        'scaling_method': 'standard',
+        'mode': 'train',
+        'encoders_path': './encoders'
+    }
+    
+    # Create datasets
+    train_dataset = OptimizedTFTDataset(**dataset_config)
+    
+    val_config = dataset_config.copy()
+    val_config['mode'] = 'val'
+    val_dataset = OptimizedTFTDataset(**val_config)
+    
+    # Create dataloaders with adapters
+    train_loader, train_adapter = create_tft_dataloader(
+        train_dataset, batch_size=32, shuffle=True
+    )
+    val_loader, val_adapter = create_tft_dataloader(
+        val_dataset, batch_size=32, shuffle=False
+    )
+    
+    # Initialize model
+    model = TemporalFusionTransformer(
+        hidden_layer_size=160,
+        num_attention_heads=4,
+        num_historical_continuous=3,
+        num_future_continuous=2,
+        historical_steps=30,
+        prediction_steps=7,
+        num_outputs=3,  # For 3 quantiles
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    
+    # Train with explicit parameters
+    trainer = TFTTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        adapter=train_adapter,
+        
+        # Loss configuration
+        loss_type='quantile',
+        loss_params={'quantiles': [0.1, 0.5, 0.9]},
+        
+        # Optimizer configuration
+        optimizer_type='adam',
+        learning_rate=1e-3,
+        weight_decay=1e-5,
+        
+        # Scheduler configuration
+        scheduler_type='reduce_on_plateau',
+        scheduler_factor=0.5,
+        scheduler_patience=10,
+        
+        # Training options
+        enable_gradient_clipping=True,
+        max_grad_norm=1.0,
+        enable_sample_weighting=False,
+        
+        # Checkpointing
+        save_path='./checkpoints',
+        save_every=5
+    )
+    
+    trainer.train(num_epochs=100, patience=20)
+    
+    # Inference
+    inference = TFTInference(
+        model_path='./checkpoints/best_model.pt',
+        model=model,  # Same architecture as training
+        adapter=val_adapter
+    )
+    
+    # Predict on test data
+    test_config = dataset_config.copy()
+    test_config['mode'] = 'test'
+    test_dataset = OptimizedTFTDataset(**test_config)
+    test_loader, test_adapter = create_tft_dataloader(
+        test_dataset, batch_size=32, shuffle=False
+    )
+    
+    predictions, targets = inference.predict_batch(test_loader)
+    
+    print("Training and inference completed!")
+    print(f"Predictions shape: {predictions.shape}")
+    if targets is not None:
+        print(f"Targets shape: {targets.shape}")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
