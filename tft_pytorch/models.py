@@ -1,16 +1,10 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
-
-
-# In[ ]:
 
 
 # Helper: Imitate Keras "TimeDistributed" in PyTorch
@@ -41,9 +35,6 @@ def apply_time_distributed(module, x):
     return y
 
 
-# In[ ]:
-
-
 # Masking Utils
 
 def create_padding_mask(seq):
@@ -71,9 +62,6 @@ def causal_mask(size):
     mask = torch.ones(size, size).triu(diagonal=1)
     # This mask has 0 on diagonal+below, 1 above diag => "causal" means we block future tokens
     return mask
-
-
-# In[ ]:
 
 
 # Scaled Dot-Product Attention

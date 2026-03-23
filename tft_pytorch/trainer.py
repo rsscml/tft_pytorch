@@ -1,12 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
-
-
-#!/usr/bin/env python
-# coding: utf-8
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,10 +16,6 @@ from datetime import datetime
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
-
-# In[ ]:
 
 
 class TFTTrainer:
@@ -163,7 +153,7 @@ class TFTTrainer:
     def setup_loss(self):
         """Setup loss function based on configuration."""
         # Import loss functions
-        from TFT_Losses_Pytorch import (
+        from losses import (
             QuantileLoss, MSELoss, MAELoss, HuberLoss, 
             TweedieLoss, CombinedLoss, AdaptiveLoss
         )
@@ -214,7 +204,7 @@ class TFTTrainer:
     
     def _get_loss_function(self, loss_type: str, **kwargs):
         """Helper to get loss function by type."""
-        from TFT_Loss_Functions import (
+        from losses import (
             QuantileLoss, MSELoss, MAELoss, HuberLoss, TweedieLoss
         )
         
@@ -905,124 +895,3 @@ class TFTInferenceWithTracking(TFTInference):
         
         return values
     
-
-
-# In[ ]:
-
-
-"""
-# Example usage
-def main():
-    #Example training and inference pipeline
-    
-    # Import necessary modules
-    from TFT_Dataset_Optimized_Latest import (
-        OptimizedTFTDataset, create_tft_dataloader
-    )
-    from Transformer_TFT_Models import TemporalFusionTransformer
-    
-    # Create your dataset
-    dataset_config = {
-        'data_source': 'path/to/data.csv',
-        'features_config': {
-            'entity_col': 'store_id',
-            'time_index_col': 'date',
-            'target_col': 'sales',
-            'temporal_known_numeric_col_list': ['temperature', 'price'],
-            'temporal_known_categorical_col_list': ['day_of_week'],
-            # ... more features
-        },
-        'historical_steps': 30,
-        'prediction_steps': 7,
-        'scaling_method': 'standard',
-        'mode': 'train',
-        'encoders_path': './encoders'
-    }
-    
-    # Create datasets
-    train_dataset = OptimizedTFTDataset(**dataset_config)
-    
-    val_config = dataset_config.copy()
-    val_config['mode'] = 'val'
-    val_dataset = OptimizedTFTDataset(**val_config)
-    
-    # Create dataloaders with adapters
-    train_loader, train_adapter = create_tft_dataloader(
-        train_dataset, batch_size=32, shuffle=True
-    )
-    val_loader, val_adapter = create_tft_dataloader(
-        val_dataset, batch_size=32, shuffle=False
-    )
-    
-    # Initialize model
-    model = TemporalFusionTransformer(
-        hidden_layer_size=160,
-        num_attention_heads=4,
-        num_historical_continuous=3,
-        num_future_continuous=2,
-        historical_steps=30,
-        prediction_steps=7,
-        num_outputs=3,  # For 3 quantiles
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
-    
-    # Train with explicit parameters
-    trainer = TFTTrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        adapter=train_adapter,
-        
-        # Loss configuration
-        loss_type='quantile',
-        loss_params={'quantiles': [0.1, 0.5, 0.9]},
-        
-        # Optimizer configuration
-        optimizer_type='adam',
-        learning_rate=1e-3,
-        weight_decay=1e-5,
-        
-        # Scheduler configuration
-        scheduler_type='reduce_on_plateau',
-        scheduler_factor=0.5,
-        scheduler_patience=10,
-        
-        # Training options
-        enable_gradient_clipping=True,
-        max_grad_norm=1.0,
-        enable_sample_weighting=False,
-        
-        # Checkpointing
-        save_path='./checkpoints',
-        save_every=5
-    )
-    
-    trainer.train(num_epochs=100, patience=20)
-    
-    # Inference
-    inference = TFTInference(
-        model_path='./checkpoints/best_model.pt',
-        model=model,  # Same architecture as training
-        adapter=val_adapter
-    )
-    
-    # Predict on test data
-    test_config = dataset_config.copy()
-    test_config['mode'] = 'test'
-    test_dataset = OptimizedTFTDataset(**test_config)
-    test_loader, test_adapter = create_tft_dataloader(
-        test_dataset, batch_size=32, shuffle=False
-    )
-    
-    predictions, targets = inference.predict_batch(test_loader)
-    
-    print("Training and inference completed!")
-    print(f"Predictions shape: {predictions.shape}")
-    if targets is not None:
-        print(f"Targets shape: {targets.shape}")
-
-
-if __name__ == "__main__":
-    main()
-"""
-
