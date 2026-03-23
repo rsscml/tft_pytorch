@@ -154,7 +154,7 @@ class TFTTrainer:
     def setup_loss(self):
         """Setup loss function based on configuration."""
         # Import loss functions
-        from losses import (
+        from .losses import (
             QuantileLoss, MSELoss, MAELoss, HuberLoss, 
             TweedieLoss, CombinedLoss, AdaptiveLoss
         )
@@ -205,7 +205,7 @@ class TFTTrainer:
     
     def _get_loss_function(self, loss_type: str, **kwargs):
         """Helper to get loss function by type."""
-        from losses import (
+        from .losses import (
             QuantileLoss, MSELoss, MAELoss, HuberLoss, TweedieLoss
         )
         
