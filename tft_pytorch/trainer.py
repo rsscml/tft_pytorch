@@ -253,8 +253,7 @@ class TFTTrainer:
                 self.optimizer,
                 mode='min',
                 factor=self.scheduler_factor,
-                patience=self.scheduler_patience,
-                verbose=True
+                patience=self.scheduler_patience
             )
         elif self.scheduler_type == 'cosine':
             self.scheduler = CosineAnnealingWarmRestarts(
