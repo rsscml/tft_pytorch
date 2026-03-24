@@ -347,8 +347,15 @@ class TFTTrainer:
                     )
 
                     # Ensure non-negative (clip at 0 for safety)
-                    predictions_original = torch.clamp(predictions_original, min=0)
-                    targets_original = torch.clamp(targets_original, min=0)
+                    predictions_original = torch.clamp(predictions_original, min=0).to(predictions.device)
+                    targets_original = torch.clamp(targets_original, min=0).to(predictions.device)
+
+                    # Keep kwargs on same device too
+                    if loss_kwargs.get('mask') is not None:
+                        loss_kwargs['mask'] = loss_kwargs['mask'].to(predictions_original.device)
+
+                    if loss_kwargs.get('sample_weight') is not None:
+                        loss_kwargs['sample_weight'] = loss_kwargs['sample_weight'].to(predictions_original.device)
 
                     # Calculate loss with mask and weights
                     loss = self.criterion(predictions_original, targets_original, **loss_kwargs)
@@ -476,8 +483,15 @@ class TFTTrainer:
                     )
 
                     # Ensure non-negative (clip at 0 for safety)
-                    predictions_original = torch.clamp(predictions_original, min=0)
-                    targets_original = torch.clamp(targets_original, min=0)
+                    predictions_original = torch.clamp(predictions_original, min=0).to(predictions.device)
+                    targets_original = torch.clamp(targets_original, min=0).to(predictions.device)
+
+                    # Keep kwargs on same device too
+                    if loss_kwargs.get('mask') is not None:
+                        loss_kwargs['mask'] = loss_kwargs['mask'].to(predictions_original.device)
+
+                    if loss_kwargs.get('sample_weight') is not None:
+                        loss_kwargs['sample_weight'] = loss_kwargs['sample_weight'].to(predictions_original.device)
 
                     # Calculate loss with mask and weights
                     loss = self.criterion(predictions_original, targets_original, **loss_kwargs)

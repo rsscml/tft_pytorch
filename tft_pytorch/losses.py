@@ -320,6 +320,7 @@ class TweedieLoss(nn.Module):
         
         # Apply mask
         if mask is not None:
+            mask = mask.to(loss.device)
             if mask.dim() < loss.dim():
                 for _ in range(loss.dim() - mask.dim()):
                     mask = mask.unsqueeze(-1)
@@ -327,6 +328,7 @@ class TweedieLoss(nn.Module):
         
         # Apply sample weights
         if sample_weight is not None:
+            sample_weight = sample_weight.to(loss.device)
             if sample_weight.dim() < loss.dim():
                 for _ in range(loss.dim() - sample_weight.dim()):
                     sample_weight = sample_weight.unsqueeze(-1)
