@@ -2735,8 +2735,8 @@ class OptimizedTFTDataset(Dataset):
             else:  # standard
                 object_memory_mb = n_windows * len(self.numeric_cols) * 400 / (1024**2)
             
-            print(f"  If stored as objects: ~{object_memory_mb:.1f} MB")
-            print(f"  Memory savings: {(1 - memory_mb/object_memory_mb)*100:.1f}%")
+            #print(f"  If stored as objects: ~{object_memory_mb:.1f} MB")
+            #print(f"  Memory savings: {(1 - memory_mb/object_memory_mb)*100:.1f}%")
     
     def get_dataset_statistics(self) -> Dict:
         """Get comprehensive dataset statistics."""
