@@ -1261,7 +1261,7 @@ class OptimizedTFTDataset(Dataset):
                     imported_scaler = imported_entity_scalers[entity_id]
                     for window_idx in entity_to_all_windows[entity_id]:
                         self.scaler_params[window_idx] = imported_scaler.copy()
-                    print(f"    Assigned scaler to {len(entity_to_all_windows[entity_id])} windows for entity {entity_id}")
+                    #print(f"    Assigned scaler to {len(entity_to_all_windows[entity_id])} windows for entity {entity_id}")
 
         # If all entities used imported scalers, we're done
         if not entities_to_fit:
@@ -1549,7 +1549,7 @@ class OptimizedTFTDataset(Dataset):
             # Assign to ultra-short entities
             for window_idx, entity_id in ultra_short_entities:
                 self.scaler_params[window_idx] = global_scaler.copy()
-                print(f"Assigned global scaler to ultra-short entity {entity_id}")
+                #print(f"Assigned global scaler to ultra-short entity {entity_id}")
     
     def _assign_category_scalers_to_ultra_short_orig(self, ultra_short_entities):
         """Assign category-specific scalers based on static features."""
