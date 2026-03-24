@@ -336,6 +336,8 @@ class TFTTrainer:
 
                 # Special handling for TweedieLoss
                 if self.loss_type == 'tweedie':
+                    """
+                    # This code breaks the computation graph!
                     # Inverse transform both predictions and targets
                     window_indices = batch['window_idx'].tolist()
 
@@ -359,6 +361,10 @@ class TFTTrainer:
 
                     # Calculate loss with mask and weights
                     loss = self.criterion(predictions_original, targets_original, **loss_kwargs)
+                    """
+                    predictions_clamped = torch.clamp(predictions, min=0)
+                    targets_clamped = torch.clamp(targets, min=0)
+                    loss = self.criterion(predictions_clamped, targets_clamped, **loss_kwargs)
                 else:
                     # Compute loss
                     loss = self.criterion(predictions, targets, **loss_kwargs)
@@ -472,6 +478,7 @@ class TFTTrainer:
 
                 # Special handling for TweedieLoss
                 if self.loss_type == 'tweedie':
+                    """
                     # Inverse transform both predictions and targets
                     window_indices = batch['window_idx'].tolist()
 
@@ -495,6 +502,10 @@ class TFTTrainer:
 
                     # Calculate loss with mask and weights
                     loss = self.criterion(predictions_original, targets_original, **loss_kwargs)
+                    """
+                    predictions_clamped = torch.clamp(predictions, min=0)
+                    targets_clamped = torch.clamp(targets, min=0)
+                    loss = self.criterion(predictions_clamped, targets_clamped, **loss_kwargs)
                 else:
                     loss = self.criterion(predictions, targets, **loss_kwargs)
             
