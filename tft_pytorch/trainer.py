@@ -297,7 +297,7 @@ class TFTTrainer:
 
                 # Get mask for future timesteps
                 if 'mask' in batch:
-                    future_mask = batch['mask'][:, -self.model.prediction_steps:]
+                    future_mask = batch['mask'][:, -self.model.prediction_steps:].to(self.device)
                     #print(f"mask shape: {future_mask.shape}")
                 else:
                     future_mask = None
@@ -430,7 +430,7 @@ class TFTTrainer:
                 targets = model_inputs['future_targets']
 
                 if 'mask' in batch:
-                    future_mask = batch['mask'][:, -self.model.prediction_steps:]
+                    future_mask = batch['mask'][:, -self.model.prediction_steps:].to(self.device)
                 else:
                     future_mask = None
 
