@@ -581,7 +581,7 @@ class TFTTrainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model from checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -684,7 +684,7 @@ class TFTInference:
     def load_model_weights(self):
         """Load trained model weights."""
         if self.model_path.suffix == '.pt':
-            checkpoint = torch.load(self.model_path, map_location=self.device)
+            checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
             if 'model_state_dict' in checkpoint:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
             else:
