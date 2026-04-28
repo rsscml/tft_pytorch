@@ -5,7 +5,7 @@ with open("README.md", encoding="utf-8") as f:
 
 setup(
     name="tft_pytorch",
-    version="0.1.1",
+    version="0.3.0",
     author="",
     description="PyTorch implementation of the Temporal Fusion Transformer (TFT) for time-series forecasting",
     long_description=long_description,
