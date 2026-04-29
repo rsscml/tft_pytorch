@@ -145,6 +145,30 @@ class TFTTrainer:
         
         # Setup optimizer and scheduler
         self.setup_optimizer()
+
+        # Diagnostic: log parameter counts so any future lazy-init regression
+        # is immediately visible. After the optimizer is built, model.parameters()
+        # and the optimizer's captured params should agree on both tensor count
+        # and element count. Any mismatch indicates parameters that exist on the
+        # model but are invisible to the optimizer — typically a lazy-build pattern.
+        n_tensors = sum(1 for _ in self.model.parameters())
+        n_elements = sum(p.numel() for p in self.model.parameters())
+        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        n_opt_tensors = sum(1 for g in self.optimizer.param_groups for _ in g['params'])
+        n_opt_elements = sum(p.numel() for g in self.optimizer.param_groups for p in g['params'])
+
+        logger.info(
+            f"Model: {n_elements:,} parameters ({n_trainable:,} trainable) "
+            f"across {n_tensors} tensors | "
+            f"Optimizer captured: {n_opt_elements:,} elements across {n_opt_tensors} tensors"
+        )
+        if n_opt_tensors != n_tensors or n_opt_elements != n_elements:
+            logger.warning(
+                f"Optimizer is missing {n_tensors - n_opt_tensors} parameter tensors "
+                f"({n_elements - n_opt_elements:,} elements). This usually indicates a "
+                f"lazy-init pattern in the model — submodules built in forward() instead "
+                f"of __init__(). Affected weights will not be updated during training."
+            )
         
         # Initialize metrics tracking
         self.train_losses = []

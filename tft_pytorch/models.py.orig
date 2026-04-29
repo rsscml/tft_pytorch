@@ -359,20 +359,20 @@ class TFTAddAndNormLayer(nn.Module):
     Equivalent to 'tft_add_and_norm_layer'.
     """
 
-    def __init__(self, device, normalized_shape):
+    def __init__(self, device):
         super().__init__()
         self.device = device
-        self.layer_norm = nn.LayerNorm(normalized_shape).to(device) #None  # We'll build dynamically based on last dimension
+        self.layer_norm = None  # We'll build dynamically based on last dimension
 
     def forward(self, inputs):
         # inputs is a list or tuple: [skip, gating_layer]
         skip, gating_layer = inputs
         out = skip + gating_layer
 
-        #if self.layer_norm is None:
-        #    # Build LayerNorm if needed, expecting to normalize over last dim
-        #    norm_shape = out.shape[-1]
-        #    self.layer_norm = nn.LayerNorm(norm_shape).to(self.device)
+        if self.layer_norm is None:
+            # Build LayerNorm if needed, expecting to normalize over last dim
+            norm_shape = out.shape[-1]
+            self.layer_norm = nn.LayerNorm(norm_shape).to(self.device)
 
         out = self.layer_norm(out)
         return out
@@ -431,7 +431,7 @@ class TFTGRNLayer(nn.Module):
                                         device=self.device)
 
         # Add & Norm
-        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=self.output_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device)
 
     def forward(self, inputs):
         """
@@ -717,7 +717,7 @@ class LSTMLayer(nn.Module):
                                         activation=None,
                                         device=self.device)
 
-        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=hidden_layer_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device)
 
     def forward(self, inputs):
         """
@@ -812,7 +812,7 @@ class AttentionLayer(nn.Module):
                                         use_time_distributed=True,
                                         activation=None,
                                         device=self.device)
-        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=hidden_layer_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device)
 
     def forward(self, x, attn_mask, padding_mask):
 
@@ -869,7 +869,7 @@ class FinalGatingLayer(nn.Module):
                                         use_time_distributed=True,
                                         activation=None,
                                         device=self.device)
-        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=hidden_layer_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device)
 
     def forward(self, inputs):
 

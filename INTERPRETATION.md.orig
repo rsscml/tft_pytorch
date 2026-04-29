@@ -597,46 +597,10 @@ tensors sized by training. Re-build the adapter from the dataset that
 matches your trained model.
 
 **Empty `attention_df`.**
-If `capture_attention=True` was set but `attention_df` still comes back
-empty, check `interp.num_attention_layers` (cached on the interpreter
-itself, so it survives `close()` and the `with` block exit). If it's `0`,
-no `TFTMultiHeadAttention` modules were found in the model.
-
-The most common cause is that `AttentionStack` in your `models.py` stores
-its attention layers in a plain Python list rather than `nn.ModuleList`.
-Concretely, around line 837:
-
-```python
-# Buggy — invisible to model.modules() and model.parameters()
-self.attn_layers = [AttentionLayer(...) for _ in range(num_layers)]
-
-# Correct
-self.attn_layers = nn.ModuleList(
-    [AttentionLayer(...) for _ in range(num_layers)]
-)
-```
-
-The interpretation module works around this by recursing into plain Python
-lists when looking for attention modules, so attention capture should
-still succeed after upgrading to the patched version. **However, the same
-bug also means the attention parameters were never registered with the
-optimizer and have therefore never been trained** — they're at their
-random initialisation. The model still produces sensible forecasts because
-of the residual connections in `AttentionLayer` and `FinalGatingLayer`
-that bypass the attention output, but the attention weights you capture
-will reflect random behaviour, not learned temporal patterns. Fix the
-`nn.ModuleList` issue and retrain to get meaningful attention.
-
-If `interp.num_attention_layers > 0` but `attention_df` is still empty,
-something else is wrong — possibly the model never ran (zero batches in
-the loader, or `max_batches=0`), or the dataloader yielded no usable
-samples. Print `len(result.metadata_df)` to confirm.
-
-**`AttributeError: 'NoneType' object has no attribute 'num_layers'` on `interp._capture`.**
-This happens when you check `interp._capture` after the `with` block has
-exited — `close()` correctly sets `_capture = None` to drop the hooks.
-Use `interp.num_attention_layers` instead, which is cached at construction
-and survives `close()`.
+Either you constructed the interpreter with `capture_attention=False`, or
+the model has no `TFTMultiHeadAttention` instances (the encoder-only
+variant doesn't always use it depending on `temporal_aggregation`). Check
+`interp._capture.num_layers` to confirm hooks were registered.
 
 **Empty `static_weights_df` / `historical_weights_df` / `future_weights_df`.**
 The corresponding feature group is empty in your config (e.g. you have no

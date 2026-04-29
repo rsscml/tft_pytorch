@@ -32,7 +32,6 @@ Quick start
 
 from __future__ import annotations
 
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -110,68 +109,6 @@ def future_feature_names(adapter) -> List[str]:
 # Attention capture
 # ---------------------------------------------------------------------------
 
-def _find_attention_modules(root: nn.Module) -> List[nn.Module]:
-    """Find all TFTMultiHeadAttention instances reachable from ``root``,
-    including those stored inside plain Python lists/tuples/dicts.
-
-    Why this is necessary: ``nn.Module.__setattr__`` only registers
-    submodules when the attribute is itself an ``nn.Module`` (or a
-    ``ModuleList``/``ModuleDict``/``ParameterList``). A plain Python list
-    of modules is stored as a regular attribute, so its contents do NOT
-    appear in ``self._modules`` and are invisible to ``model.modules()``.
-
-    The original ``models.py`` has exactly this pattern in
-    ``AttentionStack`` (line 837 at the time of writing):
-
-        self.attn_layers = [AttentionLayer(...) for _ in range(num_layers)]
-
-    Should be ``nn.ModuleList(...)``. Until that's fixed, the only way to
-    reach these modules is to walk the attribute dict ourselves.
-    """
-    found: List[nn.Module] = []
-    seen: set = set()
-
-    def visit(obj):
-        if id(obj) in seen:
-            return
-        seen.add(id(obj))
-
-        # Class-name check in addition to isinstance: defends against the
-        # rare case where a Jupyter-style module reload makes the imported
-        # TFTMultiHeadAttention a different class object than the one used
-        # to construct the model.
-        is_mha = (
-            isinstance(obj, TFTMultiHeadAttention)
-            or obj.__class__.__name__ == "TFTMultiHeadAttention"
-        )
-        if is_mha:
-            found.append(obj)
-            # Don't return — recurse anyway in case of nested attention
-            # (not currently used in TFT, but cheap insurance).
-
-        if isinstance(obj, nn.Module):
-            # Standard registered children.
-            for child in obj.children():
-                visit(child)
-            # Items in plain-list / plain-dict attributes that escape
-            # standard registration. We only descend into nn.Module items
-            # so we don't churn through tensors, ints, etc.
-            for attr_name, attr_val in obj.__dict__.items():
-                if attr_name.startswith("_"):
-                    continue  # _modules, _parameters, etc. already covered
-                if isinstance(attr_val, (list, tuple)):
-                    for item in attr_val:
-                        if isinstance(item, nn.Module):
-                            visit(item)
-                elif isinstance(attr_val, dict):
-                    for item in attr_val.values():
-                        if isinstance(item, nn.Module):
-                            visit(item)
-
-    visit(root)
-    return found
-
-
 class _AttentionCapture:
     """Registers forward hooks on every TFTMultiHeadAttention module in a
     model and stores the attention weights from the most recent forward
@@ -185,12 +122,12 @@ class _AttentionCapture:
         self.model = model
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
         self._buffers: List[torch.Tensor] = []
-        # Use the recursive walker rather than model.modules() to handle
-        # plain-Python-list nesting (see _find_attention_modules docstring).
-        for module in _find_attention_modules(model):
-            self._handles.append(
-                module.register_forward_hook(self._make_hook(len(self._handles)))
-            )
+        # Register in module-iteration order so layer index is stable.
+        for module in model.modules():
+            if isinstance(module, TFTMultiHeadAttention):
+                self._handles.append(
+                    module.register_forward_hook(self._make_hook(len(self._handles)))
+                )
         # Track how many attention layers we discovered. If zero, callers
         # will get an empty attention DataFrame rather than a crash.
         self.num_layers = len(self._handles)
@@ -600,24 +537,8 @@ class TFTInterpreter:
         self.max_attention_samples = max_attention_samples
 
         self._capture: Optional[_AttentionCapture] = None
-        # ``num_attention_layers`` is cached on the interpreter (not just on
-        # the capture) so it survives ``close()`` — useful for diagnostics
-        # after exiting the ``with`` block.
-        self.num_attention_layers: int = 0
         if capture_attention:
             self._capture = _AttentionCapture(model)
-            self.num_attention_layers = self._capture.num_layers
-            if self.num_attention_layers == 0:
-                warnings.warn(
-                    "TFTInterpreter could not find any TFTMultiHeadAttention "
-                    "modules in the model. Attention weights will not be "
-                    "captured (attention_df will be empty). The most common "
-                    "cause is that AttentionStack stores its attention layers "
-                    "in a plain Python list rather than nn.ModuleList — see "
-                    "the troubleshooting section of INTERPRETATION.md.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
 
         # Resolve feature names once.
         self._static_names = static_feature_names(adapter)
