@@ -25,6 +25,20 @@ After applying the remaining fixes — A, B, 3, and optionally C — the model
 **must be retrained from scratch**. Existing checkpoints contain random
 values for the affected weights and cannot be salvaged.
 
+### Confirmed: the trainer does not work around this
+
+`TFTTrainer.__init__` (in `trainer.py`) calls `setup_loss()` and then
+`setup_optimizer()` (line 147), which captures `self.model.parameters()`
+*before* any forward pass occurs. The four `self.model(...)` call sites
+in `trainer.py` (lines 283, 432, 746, 802) all live inside
+`train_epoch`, `validate`, or the `TFTInference` predict methods — none
+of them is reachable from `TFTTrainer.__init__`. So the optimizer
+captures placeholder/empty parameters, exactly as described above. A
+dummy forward in user code before constructing the trainer would mask
+the symptom but is fragile (e.g. a fresh-session `load_checkpoint` with
+`strict=True` would still fail on shape mismatch). The structural fixes
+below are the durable solution.
+
 ---
 
 ## Background reminder: why this is happening
@@ -219,19 +233,32 @@ In short: **most of the actual learnable matrices in the model**.
 
 ### Recommended fix
 
-Add an optional `input_size` argument to `__init__`, default to
-`hidden_layer_size`, and build eagerly. Drop the lazy guard.
+`TFTLinearLayer` is only ever instantiated inside `TFTGRNLayer`, at three
+places: `hidden_1`, `hidden_2`, and `context_layer`. The actual input
+dimension to each of these is *not* always `hidden_layer_size` — for
+`hidden_1` of any GRN with an explicit `output_size` (i.e. `grn_flat`
+inside both VSN classes), the input shape is `hidden_layer_size *
+output_size`. The GRN's existing `skip_layer` already encodes this:
+
+```python
+input_size = hidden_layer_size*self.output_size if output_size is not None else hidden_layer_size
+self.skip_layer = nn.Linear(input_size, self.output_size)
+```
+
+So a default of `hidden_layer_size` would be silently wrong for `grn_flat`
+and would crash with a shape mismatch on the first forward. The honest
+fix is to make `input_size` a **required** argument and pass the correct
+value at every call site:
 
 ```python
 class TFTLinearLayer(nn.Module):
-    def __init__(self, hidden_layer_size, device, input_size=None,
+    def __init__(self, hidden_layer_size, input_size, device,
                  activation=None, use_time_distributed=False, use_bias=True):
         super().__init__()
         self.use_time_distributed = use_time_distributed
         self.device = device
         self.hidden_layer_size = hidden_layer_size
-        in_dim = input_size if input_size is not None else hidden_layer_size
-        self.layer = nn.Linear(in_dim, hidden_layer_size,
+        self.layer = nn.Linear(input_size, hidden_layer_size,
                                bias=use_bias).to(self.device)
         self.activation_fn = get_activation_fn(activation)
 
@@ -243,11 +270,55 @@ class TFTLinearLayer(nn.Module):
         return self.activation_fn(out) if self.activation_fn is not None else out
 ```
 
-Existing call sites pass only `hidden_layer_size`, which now matches the
-default. No call site updates are required unless you have a
-`TFTLinearLayer` somewhere whose actual input dimension differs from
-`hidden_layer_size` — none in the current `models.py` do, so this is a
-zero-touch fix at the call sites.
+Update the three call sites in `TFTGRNLayer.__init__` to compute the
+GRN's input size once (mirroring `skip_layer`) and pass the correct
+value to each role:
+
+| Role | `input_size` value | Reason |
+|---|---|---|
+| `hidden_1` | `hidden_layer_size * output_size` if `output_size is not None` else `hidden_layer_size` | Receives the same input as `skip_layer` |
+| `hidden_2` | `hidden_layer_size` | Consumes `hidden_1`'s output |
+| `context_layer` | `hidden_layer_size` | Every context vector in this codebase comes from a `StaticContexts` GRN with `output_size=None`, so its dim is `hidden_layer_size` |
+
+Concretely:
+
+```python
+# In TFTGRNLayer.__init__, replace the input_size / sub-module block with:
+
+grn_input_size = (hidden_layer_size * self.output_size
+                  if output_size is not None
+                  else hidden_layer_size)
+
+self.skip_layer = nn.Linear(grn_input_size, self.output_size)
+
+self.hidden_1 = TFTLinearLayer(
+    hidden_layer_size=hidden_layer_size,
+    input_size=grn_input_size,
+    activation=None,
+    use_time_distributed=use_time_distributed,
+    device=self.device,
+)
+
+self.hidden_2 = TFTLinearLayer(
+    hidden_layer_size=hidden_layer_size,
+    input_size=hidden_layer_size,
+    activation=None,
+    use_time_distributed=use_time_distributed,
+    device=self.device,
+)
+
+if additional_context:
+    self.context_layer = TFTLinearLayer(
+        hidden_layer_size=hidden_layer_size,
+        input_size=hidden_layer_size,
+        activation=None,
+        use_time_distributed=use_time_distributed,
+        device=self.device,
+        use_bias=False,
+    )
+else:
+    self.context_layer = None
+```
 
 ---
 
@@ -292,21 +363,23 @@ in the model is orphaned.
 
 ### Recommended fix
 
-Same pattern as Bug A — add an optional `input_size`, default to
-`hidden_layer_size`, build eagerly:
+Same approach as Bug A — make `input_size` a **required** argument and
+pass the correct value at every call site. Note that the gate's
+`hidden_layer_size` parameter is the *output* dimension, which differs
+from the input dim in the `TFTGRNLayer` case (where input =
+`hidden_layer_size`, output = `output_size`).
 
 ```python
 class TFTApplyGatingLayer(nn.Module):
-    def __init__(self, hidden_layer_size, device, input_size=None,
+    def __init__(self, hidden_layer_size, input_size, device,
                  dropout_rate=0.0, use_time_distributed=True, activation=None):
         super().__init__()
         self.dropout = nn.Dropout(dropout_rate)
         self.use_time_distributed = use_time_distributed
         self.device = device
         self.hidden_layer_size = hidden_layer_size
-        in_dim = input_size if input_size is not None else hidden_layer_size
-        self.activation_fc = nn.Linear(in_dim, hidden_layer_size).to(self.device)
-        self.gated_fc      = nn.Linear(in_dim, hidden_layer_size).to(self.device)
+        self.activation_fc = nn.Linear(input_size, hidden_layer_size).to(self.device)
+        self.gated_fc      = nn.Linear(input_size, hidden_layer_size).to(self.device)
 
         if activation is None:
             self.activation_fn = None
@@ -329,10 +402,20 @@ class TFTApplyGatingLayer(nn.Module):
         return a * g, g
 ```
 
-As with Bug A, all current call sites already pass `hidden_layer_size`
-as the input dim implicitly (because the predecessor in every chain
-outputs `hidden_layer_size`), so the default works and no call site
-edits are needed.
+Update the four call sites:
+
+| Call site | `input_size` value | `hidden_layer_size` (= output) |
+|---|---|---|
+| `TFTGRNLayer` (line 427) | the GRN's `hidden_layer_size` | `self.output_size` |
+| `LSTMLayer` (line 714) | `hidden_layer_size` | `hidden_layer_size` |
+| `AttentionLayer` (line 810) | `hidden_layer_size` | `hidden_layer_size` |
+| `FinalGatingLayer` (line 867) | `hidden_layer_size` | `hidden_layer_size` |
+
+The `TFTGRNLayer` row is the trap: a default of `hidden_layer_size` (the
+gate's own param, which equals `output_size` in this case) would have
+silently built `Linear(output_size, output_size)` instead of
+`Linear(hidden_layer_size, output_size)`, and crashed at runtime when
+the gate received `hidden_2`'s output of dimension `hidden_layer_size`.
 
 ---
 
