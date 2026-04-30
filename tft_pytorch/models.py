@@ -335,21 +335,20 @@ class TFTAddAndNormLayer(nn.Module):
     def __init__(self, device, normalized_shape):
         super().__init__()
         self.device = device
-        #self.layer_norm = nn.LayerNorm(normalized_shape).to(device)
-        self.layer_norm = None # Don't learn these params, just normalize
+        self.layer_norm = nn.LayerNorm(normalized_shape).to(device)
+        #self.layer_norm = None # Don't learn these params, just normalize
 
     def forward(self, inputs):
         # inputs is a list or tuple: [skip, gating_layer]
         skip, gating_layer = inputs
-        out = skip + gating_layer
+        #out = skip + gating_layer
+        #if self.layer_norm is None:
+        #    # Build LayerNorm if needed, expecting to normalize over last dim
+        #    norm_shape = out.shape[-1]
+        #    self.layer_norm = nn.LayerNorm(norm_shape).to(self.device)
+        #out = self.layer_norm(out)
 
-        if self.layer_norm is None:
-            # Build LayerNorm if needed, expecting to normalize over last dim
-            norm_shape = out.shape[-1]
-            self.layer_norm = nn.LayerNorm(norm_shape).to(self.device)
-        out = self.layer_norm(out)
-
-        return out #self.layer_norm(skip + gating_layer)
+        return self.layer_norm(skip + gating_layer)
 
 class TFTGRNLayer(nn.Module):
     """
