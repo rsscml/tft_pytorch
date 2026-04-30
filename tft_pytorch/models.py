@@ -88,21 +88,15 @@ def scaled_dot_product_attention(q, k, v, causal_mask=None, padding_mask=None):
     #print("matmul_qk shape: ", matmul_qk.shape)
     #print("dk: ", dk)
 
-    # Apply masks. Use the smallest finite value of the logits' dtype rather
-    # than -1e9 so this stays correct under fp16 autocast — in fp16, -1e9
-    # overflows to -inf and a fully-masked row produces NaN after softmax.
-    # finfo(...).min is dtype-aware: it's representable in the active dtype
-    # and small enough that softmax sends those positions to ~0.
-    mask_fill_value = torch.finfo(scaled_logits.dtype).min
-
+    # Broadcast / add masks
     if causal_mask is not None:
-        # causal_mask shape: [seq_len_q, seq_len_k] or broadcastable.
-        # 1 where we should block, 0 otherwise.
-        scaled_logits = scaled_logits.masked_fill(causal_mask.bool(), mask_fill_value)
+        # causal_mask shape: [seq_len_q, seq_len_k] or broadcastable
+        # We assume 1 where we should block, else 0 => multiply by -1e9
+        scaled_logits = scaled_logits + (causal_mask * -1e9)
 
     if padding_mask is not None:
-        # padding_mask shape: e.g. [B, 1, seq_len_k], broadcastable to scaled_logits.
-        scaled_logits = scaled_logits.masked_fill(padding_mask.bool(), mask_fill_value)
+        # padding_mask shape: e.g. [B, 1, seq_len_k], must be broadcastable to scaled_logits
+        scaled_logits = scaled_logits + (padding_mask * -1e9)
 
     # Softmax across seq_len_k dimension (the last dimension)
     attention_weights = F.softmax(scaled_logits, dim=-1)
@@ -145,9 +139,7 @@ class TFTMultiHeadAttention(nn.Module):
         self.vs_layers = nn.ModuleList([vs_layer for _ in range(n_head)])
 
         self.dropout = nn.Dropout(dropout_rate)
-        # NOTE: input dim is d_v (not d_model) because heads are averaged, not
-        # concatenated. After averaging, head outputs have width d_v.
-        self.w_o = nn.Linear(self.d_v, d_model, bias=False).to(self.device)
+        self.w_o = nn.Linear(d_model, d_model, bias=False).to(self.device)
 
     def forward(self, q, k, v, causal_mask=None, padding_mask=None):
         """
@@ -171,15 +163,24 @@ class TFTMultiHeadAttention(nn.Module):
             heads.append(head)
             attns.append(attn)
 
-        # Combine heads. TFT's "Interpretable Multi-Head Attention" (Lim et al.,
-        # 2019) shares V across heads and AVERAGES the per-head outputs (rather
-        # than concatenating, as in standard MHA). With shared V this collapses
-        # the per-head attention patterns into a single attention map you can
-        # actually visualise — which is the whole point of the design.
-        out = torch.stack(heads, dim=0).mean(dim=0)  # [B, T, d_v]
-        attn = torch.stack(attns, dim=0)             # [n_head, B, T, seq_len_k]
+        # Stack heads => shape [n_head, B, T, d_v]
+        #head = torch.stack(heads, dim=0)  # (n_head, B, T, d_v)
+        
+        out = torch.cat(heads, dim=-1)
+        
+        attn = torch.stack(attns, dim=0)  # (n_head, B, T, T)
+        
+        #print("head : ", head.shape)
+        #print("attn : ", attn.shape)
+        # Average across heads => shape [B, T, d_v]
+        # ( or you could concatenate them if you prefer the standard MHA practice,
+        #   but your code does reduce_mean across heads)
+        #if self.n_head > 1:
+        #    out = torch.mean(head, dim=0)  # [B, T, d_v]
+        #else:
+        #    out = head.squeeze(0)  # [B, T, d_v]
 
-        out = self.w_o(out)  # [B, T, d_v] -> [B, T, d_model]
+        out = self.w_o(out)  # project back to d_model
         out = self.dropout(out)
 
         return out, attn
@@ -219,21 +220,37 @@ class TFTLinearLayer(nn.Module):
     A Dense layer with optional time-distribution and optional activation.
     """
 
-    def __init__(self, hidden_layer_size, input_size, device,
-                 activation=None, use_time_distributed=False, use_bias=True):
+    def __init__(self, hidden_layer_size, device, activation=None, use_time_distributed=False, use_bias=True):
         super().__init__()
         self.use_time_distributed = use_time_distributed
         self.device = device
+        self.layer = nn.Linear(in_features=0, out_features=0, bias=use_bias).to(self.device)
+        # Will set in_features dynamically at forward if desired (or pass it in the init).
+        # For simplicity, we assume you know the in_features at construction time in real usage.
+
         self.hidden_layer_size = hidden_layer_size
-        self.layer = nn.Linear(input_size, hidden_layer_size,
-                               bias=use_bias).to(self.device)
         self.activation_fn = get_activation_fn(activation)
 
+        # We will build the linear layer on-the-fly once we see the input dimension
+        # if you need strict initialization, you can do so after knowing input_dim.
+
     def forward(self, x):
+        # If we haven't set the in_features/out_features yet, do so here
+        if self.layer.in_features == 0:
+            # x shape: [B, T, in_features] or [B, in_features]
+            if x.ndimension() == 3:
+                # [B, T, F]
+                in_features = x.shape[-1]
+            else:
+                # [B, F]
+                in_features = x.shape[-1]
+            self.layer = nn.Linear(in_features, self.hidden_layer_size, bias=self.layer.bias is not None).to(self.device)
+
         if self.use_time_distributed:
             out = apply_time_distributed(self.layer, x)
         else:
             out = self.layer(x)
+
         if self.activation_fn is not None:
             out = self.activation_fn(out)
         return out
@@ -290,16 +307,15 @@ class TFTApplyGatingLayer(nn.Module):
     Equivalent to 'tft_apply_gating_layer'.
     """
 
-    def __init__(self, hidden_layer_size, input_size, device,
-                 dropout_rate=0.0, use_time_distributed=True, activation=None):
+    def __init__(self, hidden_layer_size, device, dropout_rate=0.0, use_time_distributed=True, activation=None):
         super().__init__()
         self.dropout = nn.Dropout(dropout_rate)
         self.use_time_distributed = use_time_distributed
         self.device = device
         self.hidden_layer_size = hidden_layer_size
 
-        self.activation_fc = nn.Linear(input_size, hidden_layer_size).to(self.device)
-        self.gated_fc = nn.Linear(input_size, hidden_layer_size).to(self.device)
+        self.activation_fc = nn.Linear(in_features=0, out_features=0).to(self.device)
+        self.gated_fc = nn.Linear(in_features=0, out_features=0).to(self.device)
 
         if activation is None:
             self.activation_fn = None
@@ -310,6 +326,18 @@ class TFTApplyGatingLayer(nn.Module):
             raise ValueError(f"Unsupported activation {activation}")
 
     def forward(self, x):
+        # If we haven't set the in_features/out_features yet, do so here
+        if self.activation_fc.in_features == 0:
+            # x shape: [B, T, in_features] or [B, in_features]
+            if x.ndimension() == 3:
+                # [B, T, F]
+                in_features = x.shape[-1]
+            else:
+                # [B, F]
+                in_features = x.shape[-1]
+            self.activation_fc = nn.Linear(in_features, self.hidden_layer_size).to(self.device)
+            self.gated_fc = nn.Linear(in_features, self.hidden_layer_size).to(self.device)
+
         x = self.dropout(x)
         if self.use_time_distributed:
             a = apply_time_distributed(self.activation_fc, x)
@@ -334,12 +362,20 @@ class TFTAddAndNormLayer(nn.Module):
     def __init__(self, device, normalized_shape):
         super().__init__()
         self.device = device
-        self.layer_norm = nn.LayerNorm(normalized_shape).to(device)
+        self.layer_norm = nn.LayerNorm(normalized_shape).to(device) #None  # We'll build dynamically based on last dimension
 
     def forward(self, inputs):
         # inputs is a list or tuple: [skip, gating_layer]
         skip, gating_layer = inputs
-        return self.layer_norm(skip + gating_layer)
+        out = skip + gating_layer
+
+        #if self.layer_norm is None:
+        #    # Build LayerNorm if needed, expecting to normalize over last dim
+        #    norm_shape = out.shape[-1]
+        #    self.layer_norm = nn.LayerNorm(norm_shape).to(self.device)
+
+        out = self.layer_norm(out)
+        return out
 
 
 class TFTGRNLayer(nn.Module):
@@ -363,36 +399,23 @@ class TFTGRNLayer(nn.Module):
         self.return_gate = return_gate
         self.device = device
 
-        # Input size to the GRN's main path. When output_size is explicitly
-        # set (e.g. grn_flat in a VSN), the input is the concatenation of
-        # output_size variables of size hidden_layer_size each, so the
-        # incoming tensor's last dim is hidden_layer_size * output_size.
-        # Otherwise, the input is a single hidden_layer_size-dim vector.
-        grn_input_size = (hidden_layer_size * self.output_size
-                          if output_size is not None
-                          else hidden_layer_size)
-
         # Main linear (skip connection)
-        self.skip_layer = nn.Linear(grn_input_size, self.output_size)
+        input_size = hidden_layer_size*self.output_size if output_size is not None else hidden_layer_size
+        self.skip_layer = nn.Linear(input_size, self.output_size)
 
         # Hidden layers
         self.hidden_1 = TFTLinearLayer(hidden_layer_size=hidden_layer_size,
-                                       input_size=grn_input_size,
                                        activation=None,
                                        use_time_distributed=use_time_distributed,
                                        device=self.device)
 
         self.hidden_2 = TFTLinearLayer(hidden_layer_size=hidden_layer_size,
-                                       input_size=hidden_layer_size,
                                        activation=None,
                                        use_time_distributed=use_time_distributed,
                                        device=self.device)
 
         if additional_context:
-            # Context vectors in this codebase always come from StaticContexts
-            # (a TFTGRNLayer with output_size=None), so their dim is hidden_layer_size.
             self.context_layer = TFTLinearLayer(hidden_layer_size=hidden_layer_size,
-                                                input_size=hidden_layer_size,
                                                 activation=None,
                                                 use_time_distributed=use_time_distributed,
                                                 device=self.device,
@@ -400,18 +423,15 @@ class TFTGRNLayer(nn.Module):
         else:
             self.context_layer = None
 
-        # Gate. Note: the gate's output dim is self.output_size, but its
-        # input dim is hidden_layer_size (it consumes hidden_2's output).
+        # Gate
         self.gate = TFTApplyGatingLayer(hidden_layer_size=self.output_size,
-                                        input_size=hidden_layer_size,
                                         dropout_rate=dropout_rate,
                                         use_time_distributed=use_time_distributed,
                                         activation=None,
                                         device=self.device)
 
         # Add & Norm
-        self.add_norm = TFTAddAndNormLayer(device=self.device,
-                                           normalized_shape=self.output_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=self.output_size)
 
     def forward(self, inputs):
         """
@@ -499,9 +519,10 @@ class VariableSelectionStatic(nn.Module):
         """
         inputs: list of static vars, each shape [B, var_dim].
         We concatenate => [B, sum_of_var_dims].
-        Note: build_layers is called eagerly from the parent module's __init__,
-        so grn_flat is always populated by the time forward runs.
         """
+        if self.grn_flat is None:
+            self.build_layers(num_vars=len(inputs))
+
         flatten = torch.cat(inputs, dim=1)  # [B, sum_of_var_dims]
         mlp_outputs = self.grn_flat(flatten)  # [B, num_vars]
 
@@ -628,17 +649,20 @@ class VariableSelectionTemporal(nn.Module):
          - else, list_of_tensors
         list_of_tensors: each shape [B, T, dim_i]
         context: shape [B, context_dim]
-        Note: build_layers is called eagerly from the parent module's __init__,
-        so grn_flat is always populated by the time forward runs.
         """
         if self.static_context:
             inputs, context = x
+            if self.grn_flat is None:
+                self.build_layers(len(inputs))
+
             # Expand context => [B, 1, context_dim]
             context = context.unsqueeze(1)
             flatten = torch.cat(inputs, dim=-1)  # [B, T, sum_of_dims]
             mlp_outputs = self.grn_flat((flatten, context))
         else:
             inputs = x
+            if self.grn_flat is None:
+                self.build_layers(len(inputs))
             flatten = torch.cat(inputs, dim=-1)  # [B, T, sum_of_dims]
             mlp_outputs = self.grn_flat(flatten)
 
@@ -688,14 +712,12 @@ class LSTMLayer(nn.Module):
                                    batch_first=True)
 
         self.gate = TFTApplyGatingLayer(hidden_layer_size=self.hidden_layer_size,
-                                        input_size=self.hidden_layer_size,
                                         dropout_rate=self.dropout_rate,
                                         use_time_distributed=True,
                                         activation=None,
                                         device=self.device)
 
-        self.add_norm = TFTAddAndNormLayer(device=self.device,
-                                           normalized_shape=self.hidden_layer_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=hidden_layer_size)
 
     def forward(self, inputs):
         """
@@ -786,13 +808,11 @@ class AttentionLayer(nn.Module):
         self.device = device
         self.mha = TFTMultiHeadAttention(n_head=n_head, d_model=hidden_layer_size, dropout_rate=dropout_rate, device=self.device)
         self.gate = TFTApplyGatingLayer(hidden_layer_size=hidden_layer_size,
-                                        input_size=hidden_layer_size,
                                         dropout_rate=dropout_rate,
                                         use_time_distributed=True,
                                         activation=None,
                                         device=self.device)
-        self.add_norm = TFTAddAndNormLayer(device=self.device,
-                                           normalized_shape=hidden_layer_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=hidden_layer_size)
 
     def forward(self, x, attn_mask, padding_mask):
 
@@ -845,13 +865,11 @@ class FinalGatingLayer(nn.Module):
         self.dropout_rate = dropout_rate
         self.device = device
         self.gate = TFTApplyGatingLayer(hidden_layer_size=hidden_layer_size,
-                                        input_size=hidden_layer_size,
                                         dropout_rate=dropout_rate,
                                         use_time_distributed=True,
                                         activation=None,
                                         device=self.device)
-        self.add_norm = TFTAddAndNormLayer(device=self.device,
-                                           normalized_shape=hidden_layer_size)
+        self.add_norm = TFTAddAndNormLayer(device=self.device, normalized_shape=hidden_layer_size)
 
     def forward(self, inputs):
 
@@ -1120,13 +1138,22 @@ class TemporalFusionTransformer(nn.Module):
 
             return embed_layer(x_safe)
         else:
-            # Bug C fix: do not silently build a new embedding inside forward
-            # — its parameters would not be visible to an optimizer that was
-            # already constructed. Force the configuration error to surface.
-            raise KeyError(
-                f"No embedding registered for categorical variable {var_name!r}. "
-                f"Add it to `categorical_embedding_dims` when constructing the model."
-            )
+            # Handle missing embedding gracefully
+            # Create a learnable embedding on the fly
+            max_idx = x.max().item() if x.numel() > 0 else 1
+            vocab_size = max(max_idx + 2, 10)  # At least 10 for stability
+
+            embed_layer = nn.Embedding(
+                vocab_size, 
+                self.hidden_layer_size,
+                padding_idx=vocab_size - 1
+            ).to(self.device)
+
+            # Add to embeddings dict for future use
+            self.categorical_embeddings[var_name] = embed_layer
+
+            # Recursively call with the new embedding
+            return self._embed_categorical(x, var_name)
     
     def _prepare_static_inputs(self, static_categorical: List[torch.Tensor], 
                               static_continuous: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -1581,23 +1608,7 @@ class TFTEncoderOnly(nn.Module):
                     num_embeddings=vocab_size,
                     embedding_dim=embed_dim
                 ).to(device)
-
-        # Fix 5: Enforce the uniform-embedding-dim contract that the VSN/GRN
-        # stack relies on. grn_flat in each VSN is sized as
-        # (hidden_layer_size * num_vars), which is only correct if every
-        # variable representation (continuous or categorical) has width
-        # hidden_layer_size. Continuous variables get this for free via
-        # nn.Linear(1, hidden_layer_size); categoricals need to be checked.
-        if categorical_embedding_dims:
-            for var_name, (_, embed_dim) in categorical_embedding_dims.items():
-                if embed_dim != hidden_layer_size:
-                    raise ValueError(
-                        f"{var_name} has embedding_dim={embed_dim}, but this "
-                        f"TFTEncoderOnly implementation requires all categorical "
-                        f"embedding dimensions to equal hidden_layer_size="
-                        f"{hidden_layer_size}."
-                    )
-
+        
         # Input transformation layers
         self.static_continuous_transforms = nn.ModuleList([
             nn.Linear(1, hidden_layer_size).to(device) 
@@ -1608,17 +1619,9 @@ class TFTEncoderOnly(nn.Module):
             nn.Linear(1, hidden_layer_size).to(device) 
             for _ in range(num_historical_continuous)
         ])
-
-        # Fix 1: Track whether this model has static inputs at all. The
-        # historical VSN's static_context flag and the forward()-time dispatch
-        # must agree, otherwise historical-only configurations crash inside
-        # VariableSelectionTemporal.forward when it tries to unpack a
-        # non-tuple input.
-        has_static_inputs = (num_static_categorical + num_static_continuous) > 0
-        self.has_static_inputs = has_static_inputs
-
+        
         # Variable Selection Networks
-        if has_static_inputs:
+        if num_static_categorical + num_static_continuous > 0:
             self.static_variable_selection = VariableSelectionStatic(
                 hidden_layer_size=hidden_layer_size,
                 dropout_rate=dropout_rate,
@@ -1633,7 +1636,7 @@ class TFTEncoderOnly(nn.Module):
         if num_historical_categorical + num_historical_continuous > 0:
             self.historical_variable_selection = VariableSelectionTemporal(
                 hidden_layer_size=hidden_layer_size,
-                static_context=has_static_inputs,
+                static_context=True,
                 dropout_rate=dropout_rate,
                 device=device
             )
@@ -1737,6 +1740,18 @@ class TFTEncoderOnly(nn.Module):
         
         self.to(device)
     
+    def _embed_categorical_buggy(self, x: torch.Tensor, var_name: str) -> torch.Tensor:
+        """Embed categorical variable."""
+        if var_name in self.categorical_embeddings:
+            return self.categorical_embeddings[var_name](x)
+        else:
+            # Default: simple embedding
+            embed_layer = nn.Embedding(
+                x.max().item() + 1, 
+                self.hidden_layer_size
+            ).to(self.device)
+            return embed_layer(x)
+        
     def _embed_categorical(self, x: torch.Tensor, var_name: str) -> torch.Tensor:
         """
         Safely embed categorical variable.
@@ -1769,105 +1784,76 @@ class TFTEncoderOnly(nn.Module):
 
             return embed_layer(x_safe)
         else:
-            # Bug C fix: do not silently build a new embedding inside forward
-            # — its parameters would not be visible to an optimizer that was
-            # already constructed. Force the configuration error to surface.
-            raise KeyError(
-                f"No embedding registered for categorical variable {var_name!r}. "
-                f"Add it to `categorical_embedding_dims` when constructing the model."
-            )
+            # Handle missing embedding gracefully
+            # Create a learnable embedding on the fly
+            max_idx = x.max().item() if x.numel() > 0 else 1
+            vocab_size = max(max_idx + 2, 10)  # At least 10 for stability
+
+            embed_layer = nn.Embedding(
+                vocab_size, 
+                self.hidden_layer_size,
+                padding_idx=vocab_size - 1
+            ).to(self.device)
+
+            # Add to embeddings dict for future use
+            self.categorical_embeddings[var_name] = embed_layer
+
+            # Recursively call with the new embedding
+            return self._embed_categorical(x, var_name)
     
     def _prepare_static_inputs(self, 
                               static_categorical: List[torch.Tensor], 
                               static_continuous: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Prepare static inputs.
-
-        Fix 2: Use shape-specific squeeze(-1) instead of bare .squeeze() to
-        preserve the batch dimension when batch_size=1 (a [1, 1] input would
-        otherwise collapse to a scalar and break downstream concatenation).
-        Also validate input shapes early so configuration errors surface with
-        a clear message rather than as a cryptic shape mismatch.
-        """
+        """Prepare static inputs."""
         static_inputs = []
-
+        
         # Process categorical variables
         for i, cat_var in enumerate(static_categorical):
-            # Accept [B] or [B, 1], but preserve batch dimension.
-            if cat_var.dim() == 2 and cat_var.shape[-1] == 1:
-                cat_var = cat_var.squeeze(-1)
-            elif cat_var.dim() != 1:
-                raise ValueError(
-                    f"static_categorical[{i}] must have shape [B] or [B, 1], "
-                    f"got {tuple(cat_var.shape)}"
-                )
-
-            embedded = self._embed_categorical(cat_var.long(), f"static_cat_{i}")
+            embedded = self._embed_categorical(cat_var.squeeze(), f"static_cat_{i}")
             static_inputs.append(embedded)
-
-        # Process continuous variables
+        
+        # Process continuous variables  
         for i, cont_var in enumerate(static_continuous):
             if cont_var.dim() == 1:
                 cont_var = cont_var.unsqueeze(-1)
-            elif cont_var.dim() != 2 or cont_var.shape[-1] != 1:
-                raise ValueError(
-                    f"static_continuous[{i}] must have shape [B] or [B, 1], "
-                    f"got {tuple(cont_var.shape)}"
-                )
-
             transformed = self.static_continuous_transforms[i](cont_var)
             static_inputs.append(transformed)
-
+        
         return static_inputs
     
     def _prepare_historical_inputs(self,
                                   categorical_vars: List[torch.Tensor],
                                   continuous_vars: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Prepare historical temporal inputs.
-
-        Fix 3: Accept both [B, T] and [B, T, 1] for each input, cast
-        categorical indices to long before embedding lookup, and validate
-        shapes early so malformed inputs raise a clear error rather than a
-        downstream shape mismatch.
-        """
+        """Prepare historical temporal inputs."""
         temporal_inputs = []
-
+        
         # Process categorical variables
         for i, cat_var in enumerate(categorical_vars):
-            # Accept [B, T] or [B, T, 1].
-            if cat_var.dim() == 3 and cat_var.shape[-1] == 1:
-                cat_var = cat_var.squeeze(-1)
-            elif cat_var.dim() != 2:
-                raise ValueError(
-                    f"historical_categorical[{i}] must have shape [B, T] or "
-                    f"[B, T, 1], got {tuple(cat_var.shape)}"
-                )
-
+            # cat_var shape: [batch_size, time_steps]
             batch_size, time_steps = cat_var.shape
-            cat_var_flat = cat_var.reshape(-1).long()
-
+            
+            # Reshape for embedding: [batch_size * time_steps]
+            cat_var_flat = cat_var.reshape(-1)
             embedded = self._embed_categorical(cat_var_flat, f"historical_cat_{i}")
-
+            
+            # Reshape back: [batch_size, time_steps, embed_dim]
             embed_dim = embedded.shape[-1]
             embedded = embedded.reshape(batch_size, time_steps, embed_dim)
             temporal_inputs.append(embedded)
-
+        
         # Process continuous variables
         for i, cont_var in enumerate(continuous_vars):
+            # cont_var shape: [batch_size, time_steps] or [batch_size, time_steps, 1]
             if cont_var.dim() == 2:
                 cont_var = cont_var.unsqueeze(-1)
-            elif cont_var.dim() != 3 or cont_var.shape[-1] != 1:
-                raise ValueError(
-                    f"historical_continuous[{i}] must have shape [B, T] or "
-                    f"[B, T, 1], got {tuple(cont_var.shape)}"
-                )
-
+            
             # Apply time-distributed transformation
             transformed = apply_time_distributed(
-                self.historical_continuous_transforms[i],
+                self.historical_continuous_transforms[i], 
                 cont_var
             )
             temporal_inputs.append(transformed)
-
+        
         return temporal_inputs
     
     def aggregate_temporal_features(self, 
@@ -1972,15 +1958,14 @@ class TFTEncoderOnly(nn.Module):
                 historical_categorical or [],
                 historical_continuous or []
             )
-
-            # Fix 1: Dispatch on the VSN's own static_context flag so the call
-            # site can never disagree with how the VSN was constructed. This
-            # is what made historical-only configurations crash previously.
-            if self.historical_variable_selection.static_context:
+            
+            if self.static_variable_selection is not None:
+                # Use static context for variable selection
                 historical_features, historical_weights = self.historical_variable_selection(
                     (historical_inputs, stat_vec)
                 )
             else:
+                # No static context
                 historical_features, historical_weights = self.historical_variable_selection(
                     historical_inputs
                 )
@@ -2081,14 +2066,10 @@ def create_stock_prediction_example():
     """
     Example: Predict average return over next 3 candles using past 30 candles.
     """
-
-    # Use a local hidden_layer_size so the embedding dims stay in sync with
-    # the model's hidden size (Fix 5 enforces this contract at construction).
-    hidden_layer_size = 128
-
+    
     # Model configuration for stock prediction
     model = TFTEncoderOnly(
-        hidden_layer_size=hidden_layer_size,
+        hidden_layer_size=128,
         num_attention_heads=4,
         num_lstm_layers=2,
         num_attention_layers=1,
@@ -2101,16 +2082,7 @@ def create_stock_prediction_example():
         # Historical features (OHLCV + technical indicators)
         num_historical_categorical=2,  # day_of_week, is_market_open
         num_historical_continuous=10,   # open, high, low, close, volume, RSI, MA_20, etc.
-
-        # Fix 4: every declared categorical variable must have a registered
-        # embedding (the model now hard-fails on missing entries).
-        categorical_embedding_dims={
-            "static_cat_0": (500, hidden_layer_size),    # ticker_id
-            "static_cat_1": (11, hidden_layer_size),     # sector
-            "historical_cat_0": (7, hidden_layer_size),  # day_of_week
-            "historical_cat_1": (2, hidden_layer_size),  # is_market_open
-        },
-
+        
         # Time configuration
         historical_steps=30,  # Past 30 candles
         
@@ -2183,11 +2155,9 @@ def create_classification_example():
     """
     Example: Classify market regime (trending up/down/sideways) from historical data.
     """
-
-    hidden_layer_size = 128
-
+    
     model = TFTEncoderOnly(
-        hidden_layer_size=hidden_layer_size,
+        hidden_layer_size=128,
         num_attention_heads=4,
         num_lstm_layers=1,
         num_attention_layers=1,
@@ -2198,12 +2168,7 @@ def create_classification_example():
         num_static_continuous=0,
         num_historical_categorical=1,
         num_historical_continuous=5,
-
-        # Fix 4: register the historical categorical embedding.
-        categorical_embedding_dims={
-            "historical_cat_0": (4, hidden_layer_size),  # quarter of year
-        },
-
+        
         historical_steps=50,
         
         # Classification setup
