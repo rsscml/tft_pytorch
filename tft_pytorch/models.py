@@ -135,11 +135,9 @@ class TFTMultiHeadAttention(nn.Module):
         self.qs_layers = nn.ModuleList([nn.Linear(d_model, self.d_k, bias=False) for _ in range(n_head)]).to(self.device)
         self.ks_layers = nn.ModuleList([nn.Linear(d_model, self.d_k, bias=False) for _ in range(n_head)]).to(self.device)
         # One vs_layer shared by all heads
-        vs_layer = nn.Linear(d_model, self.d_v, bias=False).to(self.device)
-        self.vs_layers = nn.ModuleList([vs_layer for _ in range(n_head)])
-
+        self.vs_layer = nn.Linear(d_model, self.d_v, bias=False).to(self.device)
         self.dropout = nn.Dropout(dropout_rate)
-        self.w_o = nn.Linear(d_model, d_model, bias=False).to(self.device)
+        self.w_o = nn.Linear(self.d_v, d_model, bias=False).to(self.device)
 
     def forward(self, q, k, v, causal_mask=None, padding_mask=None):
         """
@@ -152,11 +150,12 @@ class TFTMultiHeadAttention(nn.Module):
         """
         heads = []
         attns = []
+        vs = self.vs_layer(v)
 
         for i in range(self.n_head):
             qs = self.qs_layers[i](q)  # [B, T, d_k]
             ks = self.ks_layers[i](k)  # [B, T, d_k]
-            vs = self.vs_layers[i](v)  # [B, T, d_v]
+            #vs = self.vs_layers[i](v)  # [B, T, d_v]
 
             head, attn = scaled_dot_product_attention(qs, ks, vs, causal_mask, padding_mask)
             head = self.dropout(head)  # dropout on each head
@@ -164,26 +163,13 @@ class TFTMultiHeadAttention(nn.Module):
             attns.append(attn)
 
         # Stack heads => shape [n_head, B, T, d_v]
-        #head = torch.stack(heads, dim=0)  # (n_head, B, T, d_v)
-        
-        out = torch.cat(heads, dim=-1)
-        
-        attn = torch.stack(attns, dim=0)  # (n_head, B, T, T)
-        
-        #print("head : ", head.shape)
-        #print("attn : ", attn.shape)
-        # Average across heads => shape [B, T, d_v]
-        # ( or you could concatenate them if you prefer the standard MHA practice,
-        #   but your code does reduce_mean across heads)
-        #if self.n_head > 1:
-        #    out = torch.mean(head, dim=0)  # [B, T, d_v]
-        #else:
-        #    out = head.squeeze(0)  # [B, T, d_v]
-
+        heads = torch.stack(heads, dim=0)  # (n_head, B, T, d_v)
+        attns = torch.stack(attns, dim=0)  # (n_head, B, T, T)
+        out = heads.mean(dim=0) if self.n_head > 1 else heads.squeeze(0)
         out = self.w_o(out)  # project back to d_model
         out = self.dropout(out)
 
-        return out, attn
+        return out, attns
     
 
 
