@@ -60,7 +60,6 @@ class TFTTrainer:
                  # Checkpointing
                  save_path: str = './checkpoints',
                  save_every: int = 5,
-                 best_metric: str = 'val_loss',
                  
                  # Other
                  device: Optional[str] = None):
@@ -94,14 +93,6 @@ class TFTTrainer:
             
             save_path: Directory to save checkpoints
             save_every: Save checkpoint every N epochs
-            best_metric: Metric used to identify the best model on the validation
-                set. One of {'val_loss', 'mse', 'rmse', 'mae'}. All four are
-                lower-is-better. 'val_loss' (default) reproduces the previous
-                behaviour and tracks whatever loss function was configured via
-                `loss_type`. The other three are point-prediction metrics
-                computed in `calculate_metrics()` against the median quantile
-                (when applicable) and are always evaluated on the val_loader,
-                never on training data.
             
             device: Device to use (if None, uses model's device)
         """
@@ -144,18 +135,8 @@ class TFTTrainer:
         # Device
         self.device = device or model.device
         
-        # Best-model selection — validate up-front so a typo fails fast at
-        # construction time rather than silently after epoch 1.
-        VALID_BEST_METRICS = {'val_loss', 'mse', 'rmse', 'mae'}
-        if best_metric not in VALID_BEST_METRICS:
-            raise ValueError(
-                f"best_metric must be one of {sorted(VALID_BEST_METRICS)}, "
-                f"got '{best_metric}'"
-            )
-        self.best_metric_name = best_metric
-        self.best_metric_value = float('inf')   # all four are lower-is-better
-
         # Training state
+        self.best_val_loss = float('inf')
         self.patience_counter = 0
         self.epoch = 0
         
@@ -615,8 +596,7 @@ class TFTTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None, 
-            'best_metric_name': self.best_metric_name,
-            'best_metric_value': self.best_metric_value,
+            'best_val_loss': self.best_val_loss,
             'training_params': {
                 'loss_type': self.loss_type,
                 'optimizer_type': self.optimizer_type,
@@ -663,14 +643,7 @@ class TFTTrainer:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         self.epoch = checkpoint['epoch']
-        # Backward-compat: old checkpoints stored only 'best_val_loss'.
-        # New checkpoints carry the metric name explicitly.
-        if 'best_metric_value' in checkpoint:
-            self.best_metric_value = checkpoint['best_metric_value']
-            self.best_metric_name = checkpoint.get('best_metric_name', 'val_loss')
-        elif 'best_val_loss' in checkpoint:
-            self.best_metric_value = checkpoint['best_val_loss']
-            self.best_metric_name = 'val_loss'
+        self.best_val_loss = checkpoint['best_val_loss']
         self.train_losses = checkpoint.get('train_losses', [])
         self.val_losses = checkpoint.get('val_losses', [])
         self.metrics_history = checkpoint.get('metrics_history', {})
@@ -709,17 +682,12 @@ class TFTTrainer:
                 else:
                     self.scheduler.step()
             
-            # Check for improvement on the chosen metric.
-            # Note: `metrics` comes from validate(), which only ever iterates
-            # self.val_loader — these values never see training data.
-            current_metric_value = metrics[self.best_metric_name]
-            is_best = current_metric_value <= self.best_metric_value
+            # Check for improvement
+            is_best = val_loss < self.best_val_loss
             if is_best:
-                self.best_metric_value = current_metric_value
+                self.best_val_loss = val_loss
                 self.patience_counter = 0
-                logger.info(
-                    f"New best {self.best_metric_name}: {current_metric_value:.4f}"
-                )
+                logger.info(f"New best validation loss: {val_loss:.4f}")
             else:
                 self.patience_counter += 1
             
