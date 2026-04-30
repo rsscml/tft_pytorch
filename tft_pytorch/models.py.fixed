@@ -88,21 +88,15 @@ def scaled_dot_product_attention(q, k, v, causal_mask=None, padding_mask=None):
     #print("matmul_qk shape: ", matmul_qk.shape)
     #print("dk: ", dk)
 
-    # Apply masks. Use the smallest finite value of the logits' dtype rather
-    # than -1e9 so this stays correct under fp16 autocast — in fp16, -1e9
-    # overflows to -inf and a fully-masked row produces NaN after softmax.
-    # finfo(...).min is dtype-aware: it's representable in the active dtype
-    # and small enough that softmax sends those positions to ~0.
-    mask_fill_value = torch.finfo(scaled_logits.dtype).min
-
+    # Broadcast / add masks
     if causal_mask is not None:
-        # causal_mask shape: [seq_len_q, seq_len_k] or broadcastable.
-        # 1 where we should block, 0 otherwise.
-        scaled_logits = scaled_logits.masked_fill(causal_mask.bool(), mask_fill_value)
+        # causal_mask shape: [seq_len_q, seq_len_k] or broadcastable
+        # We assume 1 where we should block, else 0 => multiply by -1e9
+        scaled_logits = scaled_logits + (causal_mask * -1e9)
 
     if padding_mask is not None:
-        # padding_mask shape: e.g. [B, 1, seq_len_k], broadcastable to scaled_logits.
-        scaled_logits = scaled_logits.masked_fill(padding_mask.bool(), mask_fill_value)
+        # padding_mask shape: e.g. [B, 1, seq_len_k], must be broadcastable to scaled_logits
+        scaled_logits = scaled_logits + (padding_mask * -1e9)
 
     # Softmax across seq_len_k dimension (the last dimension)
     attention_weights = F.softmax(scaled_logits, dim=-1)
@@ -145,9 +139,7 @@ class TFTMultiHeadAttention(nn.Module):
         self.vs_layers = nn.ModuleList([vs_layer for _ in range(n_head)])
 
         self.dropout = nn.Dropout(dropout_rate)
-        # NOTE: input dim is d_v (not d_model) because heads are averaged, not
-        # concatenated. After averaging, head outputs have width d_v.
-        self.w_o = nn.Linear(self.d_v, d_model, bias=False).to(self.device)
+        self.w_o = nn.Linear(d_model, d_model, bias=False).to(self.device)
 
     def forward(self, q, k, v, causal_mask=None, padding_mask=None):
         """
@@ -171,15 +163,24 @@ class TFTMultiHeadAttention(nn.Module):
             heads.append(head)
             attns.append(attn)
 
-        # Combine heads. TFT's "Interpretable Multi-Head Attention" (Lim et al.,
-        # 2019) shares V across heads and AVERAGES the per-head outputs (rather
-        # than concatenating, as in standard MHA). With shared V this collapses
-        # the per-head attention patterns into a single attention map you can
-        # actually visualise — which is the whole point of the design.
-        out = torch.stack(heads, dim=0).mean(dim=0)  # [B, T, d_v]
-        attn = torch.stack(attns, dim=0)             # [n_head, B, T, seq_len_k]
+        # Stack heads => shape [n_head, B, T, d_v]
+        #head = torch.stack(heads, dim=0)  # (n_head, B, T, d_v)
+        
+        out = torch.cat(heads, dim=-1)
+        
+        attn = torch.stack(attns, dim=0)  # (n_head, B, T, T)
+        
+        #print("head : ", head.shape)
+        #print("attn : ", attn.shape)
+        # Average across heads => shape [B, T, d_v]
+        # ( or you could concatenate them if you prefer the standard MHA practice,
+        #   but your code does reduce_mean across heads)
+        #if self.n_head > 1:
+        #    out = torch.mean(head, dim=0)  # [B, T, d_v]
+        #else:
+        #    out = head.squeeze(0)  # [B, T, d_v]
 
-        out = self.w_o(out)  # [B, T, d_v] -> [B, T, d_model]
+        out = self.w_o(out)  # project back to d_model
         out = self.dropout(out)
 
         return out, attn
