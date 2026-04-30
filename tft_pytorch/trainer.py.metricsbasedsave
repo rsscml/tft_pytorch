@@ -744,8 +744,7 @@ class TFTInference:
                  model_path: str,
                  model: nn.Module,
                  adapter,
-                 device: str = 'cuda',
-                 quantiles: Optional[List[float]] = None):
+                 device: str = 'cuda'):
         """
         Initialize inference pipeline.
         
@@ -754,19 +753,11 @@ class TFTInference:
             model: Initialized model architecture (must match training)
             adapter: Data adapter (must match training setup)
             device: Device to run inference on
-            quantiles: List of quantiles the model was trained to predict
-                (e.g. [0.1, 0.5, 0.9]). Pass the same list used in
-                `loss_params['quantiles']` during training. When provided,
-                the model's output last-dim is treated as quantile-indexed
-                (single target, multiple quantiles); inverse-transforms and
-                DataFrame columns are generated accordingly. Leave as None
-                for point-prediction models.
         """
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.model_path = Path(model_path)
         self.model = model
         self.adapter = adapter
-        self.quantiles = quantiles
         
         # Load weights
         self.load_model_weights()
@@ -897,34 +888,15 @@ class TFTInferenceWithTracking(TFTInference):
                 pred_sample = predictions[i]  # Shape: [prediction_steps, num_outputs]
                 
                 if self.adapter.dataset.scaling_method != 'none':
+                    # Inverse transform for each target
                     pred_original = np.zeros_like(pred_sample)
-                    if self.quantiles is not None:
-                        # Quantile mode: last dim is num_quantiles, all referring
-                        # to the SAME (single) target. Inverse-transform every
-                        # column using that target's scaler. Without this branch
-                        # the loop below would only fill column 0 and leave the
-                        # remaining quantiles at zero.
-                        target_col = self.adapter.dataset.target_cols[0]
-                        n_q = pred_sample.shape[-1]
-                        if n_q != len(self.quantiles):
-                            logger.warning(
-                                f"Model output has {n_q} columns but {len(self.quantiles)} "
-                                f"quantiles were passed; inverse-transforming all columns "
-                                f"with the single target's scaler."
+                    for target_idx, target_col in enumerate(self.adapter.dataset.target_cols):
+                        if target_idx < pred_sample.shape[-1]:
+                            pred_original[:, target_idx] = self._inverse_transform_single(
+                                pred_sample[:, target_idx],
+                                window_idx,
+                                target_col
                             )
-                        for q_idx in range(n_q):
-                            pred_original[:, q_idx] = self._inverse_transform_single(
-                                pred_sample[:, q_idx], window_idx, target_col
-                            )
-                    else:
-                        # Point-prediction mode: last dim is num_targets.
-                        for target_idx, target_col in enumerate(self.adapter.dataset.target_cols):
-                            if target_idx < pred_sample.shape[-1]:
-                                pred_original[:, target_idx] = self._inverse_transform_single(
-                                    pred_sample[:, target_idx],
-                                    window_idx,
-                                    target_col
-                                )
                 else:
                     pred_original = pred_sample
                 
@@ -955,23 +927,13 @@ class TFTInferenceWithTracking(TFTInference):
                     
                     # Add predictions (handle multiple outputs/quantiles)
                     if pred_original.ndim == 2:
-                        if self.quantiles is not None:
-                            # Name columns from the actual quantile values so
-                            # users get pred_q05/q50/q95 etc. for non-default
-                            # quantile lists, not the hardcoded q10/q50/q90.
-                            n_q = pred_original.shape[1]
-                            for q_idx in range(n_q):
-                                if q_idx < len(self.quantiles):
-                                    label = f"pred_q{int(round(self.quantiles[q_idx] * 100)):02d}"
-                                else:
-                                    # Defensive fallback if shapes disagree
-                                    label = f"pred_{q_idx}"
-                                record[label] = pred_original[t, q_idx]
+                        if pred_original.shape[1] == 3:  # Assuming quantiles
+                            record['pred_q10'] = pred_original[t, 0]
+                            record['pred_q50'] = pred_original[t, 1]
+                            record['pred_q90'] = pred_original[t, 2]
                         else:
-                            # Point-prediction mode: one column per target.
-                            for target_idx, target_col in enumerate(self.adapter.dataset.target_cols):
-                                if target_idx < pred_original.shape[1]:
-                                    record[f'pred_{target_col}'] = pred_original[t, target_idx]
+                            for q in range(pred_original.shape[1]):
+                                record[f'pred_{q}'] = pred_original[t, q]
                     else:
                         record['prediction'] = pred_original[t]
                     
