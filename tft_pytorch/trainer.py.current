@@ -166,51 +166,27 @@ class TFTTrainer:
         self.setup_optimizer()
 
         # Diagnostic: log parameter counts so any future lazy-init regression
-        # is immediately visible. After the optimizer is built, the trainable
-        # parameter count (post-freeze) and the optimizer's captured params
-        # should agree on both tensor count and element count. A mismatch
-        # against TRAINABLE counts (not total) indicates a real problem —
-        # typically a lazy-init pattern where submodules are built in
-        # forward() instead of __init__() and therefore never reach the
-        # optimizer. A gap between total and trainable counts is expected
-        # whenever model.freeze_modules(...) was called before this trainer
-        # was constructed and is reported separately.
+        # is immediately visible. After the optimizer is built, model.parameters()
+        # and the optimizer's captured params should agree on both tensor count
+        # and element count. Any mismatch indicates parameters that exist on the
+        # model but are invisible to the optimizer — typically a lazy-build pattern.
         n_tensors = sum(1 for _ in self.model.parameters())
         n_elements = sum(p.numel() for p in self.model.parameters())
-        n_trainable_tensors = sum(1 for p in self.model.parameters()
-                                  if p.requires_grad)
-        n_trainable = sum(p.numel() for p in self.model.parameters()
-                          if p.requires_grad)
-        n_frozen = n_elements - n_trainable
+        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         n_opt_tensors = sum(1 for g in self.optimizer.param_groups for _ in g['params'])
         n_opt_elements = sum(p.numel() for g in self.optimizer.param_groups for p in g['params'])
 
-        frozen_note = (
-            f", {n_frozen:,} frozen across {n_tensors - n_trainable_tensors} tensors"
-            if n_frozen > 0 else ""
-        )
         logger.info(
-            f"Model: {n_elements:,} parameters ({n_trainable:,} trainable"
-            f"{frozen_note}) across {n_tensors} tensors | "
+            f"Model: {n_elements:,} parameters ({n_trainable:,} trainable) "
+            f"across {n_tensors} tensors | "
             f"Optimizer captured: {n_opt_elements:,} elements across {n_opt_tensors} tensors"
         )
-
-        # Surface frozen submodule names if the model exposes them — purely
-        # informational, helps catch "I thought I froze X but didn't" bugs.
-        if hasattr(self.model, "frozen_modules"):
-            frozen_names = sorted(self.model.frozen_modules())
-            if frozen_names:
-                logger.info(f"Frozen submodules: {frozen_names}")
-
-        if n_opt_tensors != n_trainable_tensors or n_opt_elements != n_trainable:
+        if n_opt_tensors != n_tensors or n_opt_elements != n_elements:
             logger.warning(
-                f"Optimizer captured {n_opt_tensors} tensors / {n_opt_elements:,} "
-                f"elements, but model has {n_trainable_tensors} trainable tensors / "
-                f"{n_trainable:,} trainable elements. The mismatch is "
-                f"{n_trainable_tensors - n_opt_tensors} tensors "
-                f"({n_trainable - n_opt_elements:,} elements). This usually indicates "
-                f"a lazy-init pattern in the model — submodules built in forward() "
-                f"instead of __init__(). Affected weights will not be updated."
+                f"Optimizer is missing {n_tensors - n_opt_tensors} parameter tensors "
+                f"({n_elements - n_opt_elements:,} elements). This usually indicates a "
+                f"lazy-init pattern in the model — submodules built in forward() instead "
+                f"of __init__(). Affected weights will not be updated during training."
             )
         
         # Initialize metrics tracking
@@ -290,35 +266,23 @@ class TFTTrainer:
         return loss_map[loss_type](**kwargs)
     
     def setup_optimizer(self):
-        """Setup optimizer and learning rate scheduler.
-
-        Only parameters with requires_grad=True are passed to the optimizer.
-        This honours any freeze_modules() calls made on the model BEFORE the
-        trainer is constructed. Filtering here (rather than relying on
-        requires_grad=False alone) is the only way to guarantee that
-        AdamW-style weight decay and momentum buffers don't quietly mutate
-        weights that the user expects to be frozen.
-        """
-        # Filter to trainable params only — frozen submodules are skipped.
-        trainable_params = [p for p in self.model.parameters()
-                            if p.requires_grad]
-
+        """Setup optimizer and learning rate scheduler."""
         # Get optimizer
         if self.optimizer_type == 'adam':
             self.optimizer = optim.Adam(
-                trainable_params,
+                self.model.parameters(),
                 lr=self.learning_rate,
                 weight_decay=self.weight_decay
             )
         elif self.optimizer_type == 'adamw':
             self.optimizer = optim.AdamW(
-                trainable_params,
+                self.model.parameters(),
                 lr=self.learning_rate,
                 weight_decay=self.weight_decay
             )
         elif self.optimizer_type == 'sgd':
             self.optimizer = optim.SGD(
-                trainable_params,
+                self.model.parameters(),
                 lr=self.learning_rate,
                 momentum=self.momentum,
                 weight_decay=self.weight_decay
