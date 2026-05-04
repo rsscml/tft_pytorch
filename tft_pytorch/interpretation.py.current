@@ -46,7 +46,6 @@ from torch import nn
 # load time; we only need the type for isinstance checks on hooks.
 from .models import TFTMultiHeadAttention
 
-
 __all__ = [
     "TFTInterpreter",
     "InterpretationResult",
@@ -229,43 +228,6 @@ class _AttentionCapture:
 # Result container
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Small helper used by the new entity-scoping API
-# ---------------------------------------------------------------------------
-
-def _normalize_ids(x):
-    """Accept either a single scalar or an iterable, return a list (or None).
-
-    Strings/bytes are treated atomically so 'store_42' isn't iterated
-    character-by-character. Tuples (composite keys) are treated as scalars
-    too — wrap them in a list to filter on multiple of them.
-    """
-    if x is None:
-        return None
-    if isinstance(x, (str, bytes, tuple)) or not hasattr(x, "__iter__"):
-        return [x]
-    return list(x)
-
-
-def _maybe_warn_no_entities(df: pd.DataFrame, entity_ids) -> None:
-    """If the user is filtering by entity_ids but no entity_id values are
-    populated, the result will be silently empty — emit a clearer warning."""
-    if entity_ids is None or df.empty:
-        return
-    if df["entity_id"].isna().all():
-        warnings.warn(
-            "Filtering by entity_ids but metadata has no populated "
-            "entity_id values — result will be empty. Make sure each "
-            "batch from your dataset includes an 'entity_id' field.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Result container
-# ---------------------------------------------------------------------------
-
 @dataclass
 class InterpretationResult:
     """Tidy long-form interpretation data for one or many forecasts.
@@ -277,18 +239,17 @@ class InterpretationResult:
     ----------
     static_weights_df : columns ``[sample_id, entity_id, window_idx, feature, weight]``
     historical_weights_df : columns ``[sample_id, entity_id, window_idx, time_step, feature, weight]``
+        ``time_step`` is 0..historical_steps-1 (0 = oldest).
     future_weights_df : columns ``[sample_id, entity_id, window_idx, horizon, feature, weight]``
+        ``horizon`` is 1..prediction_steps.
     attention_df : columns ``[sample_id, entity_id, window_idx, layer, head, query_pos, key_pos, weight]``
+        ``query_pos`` and ``key_pos`` index the *full* sequence (length
+        ``historical_steps + prediction_steps``), where positions
+        ``< historical_steps`` are past and positions ``>= historical_steps``
+        are future. May be empty if attention capture was disabled.
     predictions : ndarray ``[N, prediction_steps, num_quantiles]``
     metadata_df : DataFrame with at least ``[sample_id, entity_id, window_idx]``
     historical_steps, prediction_steps : ints from the model
-
-    Per-entity scoping
-    ------------------
-    Use ``.for_entity(eid)`` / ``.for_entities([...])`` / ``.filter(...)``
-    to obtain a narrowed `InterpretationResult` with the same API. All
-    aggregation and plot methods also accept an ``entity_ids=`` kwarg as a
-    one-shot shortcut.
     """
 
     static_weights_df: pd.DataFrame
@@ -300,103 +261,12 @@ class InterpretationResult:
     historical_steps: int
     prediction_steps: int
 
-    # ------------------------------------------------------------------ entity helpers
-
-    @property
-    def entities(self) -> list:
-        """Sorted list of unique entity_id values present in metadata.
-
-        Falls back to insertion order if entity_ids contain mixed types
-        that aren't comparable (e.g. tuples and ints together).
-        """
-        if self.metadata_df.empty:
-            return []
-        eids = self.metadata_df["entity_id"].dropna().unique().tolist()
-        try:
-            return sorted(eids)
-        except TypeError:
-            return list(eids)
-
-    def filter(
-        self,
-        entity_ids: Optional[Sequence[Any]] = None,
-        sample_ids: Optional[Sequence[int]] = None,
-        window_idx: Optional[Sequence[int]] = None,
-    ) -> "InterpretationResult":
-        """Return a new `InterpretationResult` containing only matching rows.
-
-        Filters apply to ``metadata_df`` first and propagate to every
-        long-form DataFrame and to ``predictions`` (sliced positionally so
-        predictions[i] still corresponds to metadata_df.iloc[i]).
-
-        Parameters
-        ----------
-        entity_ids : optional scalar or iterable of entity_id values.
-        sample_ids : optional scalar or iterable of sample_ids.
-        window_idx : optional scalar or iterable of window_idx values.
-
-        Notes
-        -----
-        - sample_id values are preserved (not renumbered), so you can always
-          map back to the original eval run.
-        - If no filter is supplied, returns a shallow-ish copy.
-        """
-        eid_list = _normalize_ids(entity_ids)
-        sid_list = _normalize_ids(sample_ids)
-        wid_list = _normalize_ids(window_idx)
-
-        _maybe_warn_no_entities(self.metadata_df, eid_list)
-
-        md = self.metadata_df
-        mask = pd.Series(True, index=md.index)
-        if eid_list is not None:
-            mask &= md["entity_id"].isin(eid_list)
-        if sid_list is not None:
-            mask &= md["sample_id"].isin(sid_list)
-        if wid_list is not None:
-            mask &= md["window_idx"].isin(wid_list)
-
-        keep_sample_ids = set(md.loc[mask, "sample_id"].tolist())
-
-        def _f(df: pd.DataFrame) -> pd.DataFrame:
-            if df.empty:
-                return df.copy()
-            if not keep_sample_ids:
-                return df.iloc[0:0].copy()
-            return df[df["sample_id"].isin(keep_sample_ids)].reset_index(drop=True)
-
-        new_md = md[mask].reset_index(drop=True)
-        if self.predictions.size:
-            new_pred = self.predictions[mask.to_numpy()]
-        else:
-            new_pred = self.predictions
-
-        return InterpretationResult(
-            static_weights_df=_f(self.static_weights_df),
-            historical_weights_df=_f(self.historical_weights_df),
-            future_weights_df=_f(self.future_weights_df),
-            attention_df=_f(self.attention_df),
-            predictions=new_pred,
-            metadata_df=new_md,
-            historical_steps=self.historical_steps,
-            prediction_steps=self.prediction_steps,
-        )
-
-    def for_entity(self, entity_id: Any) -> "InterpretationResult":
-        """Convenience: ``self.filter(entity_ids=[entity_id])``."""
-        return self.filter(entity_ids=[entity_id])
-
-    def for_entities(self, entity_ids: Sequence[Any]) -> "InterpretationResult":
-        """Convenience: ``self.filter(entity_ids=entity_ids)``."""
-        return self.filter(entity_ids=entity_ids)
-
     # ------------------------------------------------------------------ aggregation
 
     def feature_importance(
         self,
         scope: str = "historical",
         agg: str = "mean",
-        entity_ids: Optional[Sequence[Any]] = None,
     ) -> pd.DataFrame:
         """Aggregate VSN weights into a per-feature importance score.
 
@@ -404,11 +274,12 @@ class InterpretationResult:
         ----------
         scope : ``"static" | "historical" | "future"``
         agg : ``"mean" | "median" | "max"``
-        entity_ids : optional scalar or iterable — restrict to these entities.
 
         Returns
         -------
         DataFrame with columns ``[feature, importance]`` sorted descending.
+        For temporal scopes, weights are averaged over both samples and
+        timesteps before aggregation.
         """
         if scope == "static":
             df = self.static_weights_df
@@ -417,14 +288,7 @@ class InterpretationResult:
         elif scope == "future":
             df = self.future_weights_df
         else:
-            raise ValueError(
-                f"scope must be 'static', 'historical', or 'future'; got {scope!r}"
-            )
-
-        if entity_ids is not None:
-            eids = _normalize_ids(entity_ids)
-            _maybe_warn_no_entities(df, eids)
-            df = df[df["entity_id"].isin(eids)]
+            raise ValueError(f"scope must be 'static', 'historical', or 'future'; got {scope!r}")
 
         if df.empty:
             return pd.DataFrame(columns=["feature", "importance"])
@@ -444,12 +308,20 @@ class InterpretationResult:
         self,
         scope: str = "historical",
         features: Optional[Sequence[str]] = None,
-        entity_ids: Optional[Sequence[Any]] = None,
     ) -> pd.DataFrame:
-        """Mean VSN weight per (time_step, feature), averaged over samples.
+        """Mean VSN weight for each (time_step or horizon, feature) pair,
+        averaged over samples. Useful for line plots showing when each
+        feature mattered.
 
-        See original docstring. Adds ``entity_ids`` to scope the average to
-        a subset of entities.
+        Parameters
+        ----------
+        scope : ``"historical" | "future"``
+        features : optional whitelist of feature names
+
+        Returns
+        -------
+        Wide-format DataFrame indexed by time_step (or horizon),
+        columns = feature names, values = mean weight.
         """
         if scope == "historical":
             df = self.historical_weights_df
@@ -458,12 +330,7 @@ class InterpretationResult:
             df = self.future_weights_df
             time_col = "horizon"
         else:
-            raise ValueError("scope must be 'historical' or 'future'")
-
-        if entity_ids is not None:
-            eids = _normalize_ids(entity_ids)
-            _maybe_warn_no_entities(df, eids)
-            df = df[df["entity_id"].isin(eids)]
+            raise ValueError("scope must be 'historical' or 'future' for temporal_importance")
 
         if df.empty:
             return pd.DataFrame()
@@ -482,24 +349,29 @@ class InterpretationResult:
         self,
         layer: Optional[int] = None,
         head: Optional[int | str] = "mean",
-        entity_ids: Optional[Sequence[Any]] = None,
     ) -> pd.DataFrame:
         """Pivot attention into a (horizon × past-lag) matrix averaged over
-        samples. See original docstring; the new ``entity_ids`` kwarg
-        restricts the average to chosen entities.
+        samples. This is the classic "which past timesteps did the model
+        look at when forecasting horizon h" view from the TFT paper.
+
+        Parameters
+        ----------
+        layer : optional layer index. ``None`` averages across all layers.
+        head : int (specific head), ``"mean"`` (average across heads), or
+            ``"max"`` (max across heads). Default ``"mean"``.
+
+        Returns
+        -------
+        DataFrame indexed by horizon (1..prediction_steps), columns are
+        past lag offsets. Lag is the negative offset from the forecast
+        origin: lag=1 is the most recent historical step, lag=H is the
+        oldest. Values are mean attention weight.
         """
         if self.attention_df.empty:
             return pd.DataFrame()
 
         df = self.attention_df
-
-        if entity_ids is not None:
-            eids = _normalize_ids(entity_ids)
-            _maybe_warn_no_entities(df, eids)
-            df = df[df["entity_id"].isin(eids)]
-            if df.empty:
-                return pd.DataFrame()
-
+        # Restrict to future-query × past-key cells.
         H = self.historical_steps
         df = df[(df["query_pos"] >= H) & (df["key_pos"] < H)]
 
@@ -522,6 +394,7 @@ class InterpretationResult:
         else:
             raise ValueError("head must be int, 'mean', or 'max'")
 
+        # Convert query_pos -> horizon (1-indexed), key_pos -> past lag (1 = most recent).
         df = df.assign(
             horizon=df["query_pos"] - H + 1,
             lag=H - df["key_pos"],
@@ -529,6 +402,7 @@ class InterpretationResult:
         wide = df.pivot_table(
             index="horizon", columns="lag", values="weight", aggfunc="mean"
         )
+        # Sort lags so column 1 (most recent) is first.
         wide = wide.reindex(sorted(wide.columns), axis=1)
         return wide
 
@@ -536,15 +410,15 @@ class InterpretationResult:
         self,
         layer: Optional[int] = None,
         head: Optional[int | str] = "mean",
-        entity_ids: Optional[Sequence[Any]] = None,
     ) -> pd.Series:
-        """Mean attention per past lag, averaged over horizons and samples.
+        """Mean attention received by each past lag, averaged over horizons
+        and samples. This is the "persistent temporal pattern" plot from
+        Lim et al. — large peaks indicate recurring lags the model relies on
+        (e.g. weekly seasonality at lag 7).
 
-        See original docstring. ``entity_ids`` scopes to chosen entities.
+        Returns a Series indexed by lag (1 = most recent past step).
         """
-        wide = self.attention_by_horizon(
-            layer=layer, head=head, entity_ids=entity_ids
-        )
+        wide = self.attention_by_horizon(layer=layer, head=head)
         if wide.empty:
             return pd.Series(dtype=float, name="mean_attention")
         return wide.mean(axis=0).rename("mean_attention")
@@ -570,41 +444,23 @@ class InterpretationResult:
         paths["predictions"] = os.path.join(directory, "predictions.npy")
         return paths
 
-    # ------------------------------------------------------------------ plotting
-
-    def _entity_title_suffix(self, entity_ids) -> str:
-        """Build a small ' — entity X' / ' — N entities' suffix for plot titles."""
-        if entity_ids is None:
-            return ""
-        eids = _normalize_ids(entity_ids)
-        if len(eids) == 1:
-            return f" — entity {eids[0]}"
-        return f" — {len(eids)} entities"
+    # ------------------------------------------------------------------ plotting (optional)
 
     def plot_feature_importance(
         self,
         scope: str = "historical",
         top_k: int = 15,
         ax=None,
-        entity_ids: Optional[Sequence[Any]] = None,
     ):
-        """Bar chart of mean VSN weight per feature, optionally scoped to
-        a subset of entities."""
+        """Bar chart of mean VSN weight per feature."""
         plt = _import_matplotlib()
-        imp = self.feature_importance(scope=scope, entity_ids=entity_ids).head(top_k)
-        if imp.empty:
-            raise ValueError(
-                "No feature-importance data to plot — check your scope and "
-                "entity_ids filter."
-            )
+        imp = self.feature_importance(scope=scope).head(top_k)
         if ax is None:
             _, ax = plt.subplots(figsize=(7, max(3, 0.3 * len(imp))))
+        # Plot smallest-at-bottom by reversing.
         ax.barh(imp["feature"][::-1], imp["importance"][::-1])
         ax.set_xlabel("Mean variable selection weight")
-        ax.set_title(
-            f"{scope.capitalize()} feature importance "
-            f"(top {len(imp)}){self._entity_title_suffix(entity_ids)}"
-        )
+        ax.set_title(f"{scope.capitalize()} feature importance (top {len(imp)})")
         ax.grid(axis="x", linestyle=":", alpha=0.4)
         return ax
 
@@ -614,24 +470,18 @@ class InterpretationResult:
         head: Optional[int | str] = "mean",
         ax=None,
         cmap: str = "viridis",
-        entity_ids: Optional[Sequence[Any]] = None,
     ):
         """Heatmap of mean attention from each forecast horizon to each past lag."""
         plt = _import_matplotlib()
-        wide = self.attention_by_horizon(
-            layer=layer, head=head, entity_ids=entity_ids
-        )
+        wide = self.attention_by_horizon(layer=layer, head=head)
         if wide.empty:
             raise ValueError(
                 "No attention data to plot. Did you initialize TFTInterpreter "
-                "with capture_attention=True, and does the entity_ids filter "
-                "match any rows?"
+                "with capture_attention=True?"
             )
         if ax is None:
-            _, ax = plt.subplots(
-                figsize=(max(6, 0.25 * wide.shape[1]),
-                         max(3, 0.4 * wide.shape[0]))
-            )
+            _, ax = plt.subplots(figsize=(max(6, 0.25 * wide.shape[1]),
+                                          max(3, 0.4 * wide.shape[0])))
         im = ax.imshow(wide.values, aspect="auto", cmap=cmap, origin="lower")
         ax.set_xticks(range(wide.shape[1]))
         ax.set_xticklabels(wide.columns)
@@ -639,10 +489,7 @@ class InterpretationResult:
         ax.set_yticklabels(wide.index)
         ax.set_xlabel("Past lag (1 = most recent)")
         ax.set_ylabel("Forecast horizon")
-        ax.set_title(
-            f"Mean attention: horizon × past lag"
-            f"{self._entity_title_suffix(entity_ids)}"
-        )
+        ax.set_title("Mean attention: horizon × past lag")
         ax.figure.colorbar(im, ax=ax, label="attention weight")
         return ax
 
@@ -652,44 +499,31 @@ class InterpretationResult:
         features: Optional[Sequence[str]] = None,
         top_k: int = 5,
         ax=None,
-        entity_ids: Optional[Sequence[Any]] = None,
     ):
         """Line chart of mean VSN weight per timestep for the top-k features."""
         plt = _import_matplotlib()
         if features is None:
-            top = (
-                self.feature_importance(scope=scope, entity_ids=entity_ids)
-                .head(top_k)["feature"].tolist()
-            )
+            top = self.feature_importance(scope=scope).head(top_k)["feature"].tolist()
             features = top
-        wide = self.temporal_importance(
-            scope=scope, features=features, entity_ids=entity_ids
-        )
+        wide = self.temporal_importance(scope=scope, features=features)
         if wide.empty:
-            raise ValueError("No data to plot for the chosen scope/entity filter.")
+            raise ValueError("No data to plot for the chosen scope.")
         if ax is None:
             _, ax = plt.subplots(figsize=(8, 4))
         for feat in wide.columns:
             ax.plot(wide.index, wide[feat], marker="o", markersize=3, label=feat)
         ax.set_xlabel("time_step" if scope == "historical" else "horizon")
         ax.set_ylabel("mean variable selection weight")
-        ax.set_title(
-            f"{scope.capitalize()} temporal importance"
-            f"{self._entity_title_suffix(entity_ids)}"
-        )
+        ax.set_title(f"{scope.capitalize()} temporal importance")
         ax.legend(loc="best", fontsize=8)
         ax.grid(linestyle=":", alpha=0.4)
         return ax
 
-    def plot_persistent_temporal_pattern(
-        self,
-        ax=None,
-        entity_ids: Optional[Sequence[Any]] = None,
-        **kwargs,
-    ):
-        """Line plot of the persistent temporal attention pattern."""
+    def plot_persistent_temporal_pattern(self, ax=None, **kwargs):
+        """Line plot of persistent temporal attention pattern across all
+        horizons and samples. Useful for spotting seasonality."""
         plt = _import_matplotlib()
-        s = self.persistent_temporal_pattern(entity_ids=entity_ids, **kwargs)
+        s = self.persistent_temporal_pattern(**kwargs)
         if s.empty:
             raise ValueError("No attention data to plot.")
         if ax is None:
@@ -697,192 +531,9 @@ class InterpretationResult:
         ax.plot(s.index, s.values, marker="o", markersize=3)
         ax.set_xlabel("Past lag (1 = most recent)")
         ax.set_ylabel("Mean attention weight")
-        ax.set_title(
-            f"Persistent temporal pattern{self._entity_title_suffix(entity_ids)}"
-        )
+        ax.set_title("Persistent temporal pattern")
         ax.grid(linestyle=":", alpha=0.4)
         return ax
-
-    # ------------------------------------------------------------------ faceted by-entity plots
-
-    def _facet_grid(self, n: int, ncols: int, panel_size):
-        """Build a (fig, flat_axes) tuple with hidden trailing axes."""
-        plt = _import_matplotlib()
-        if n == 0:
-            raise ValueError("No entities to plot.")
-        ncols = max(1, min(ncols, n))
-        nrows = (n + ncols - 1) // ncols
-        fig, axes = plt.subplots(
-            nrows, ncols,
-            figsize=(panel_size[0] * ncols, panel_size[1] * nrows),
-            squeeze=False,
-        )
-        flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
-        for j in range(n, len(flat)):
-            flat[j].set_axis_off()
-        return fig, flat[:n], flat[n:]
-
-    def plot_feature_importance_by_entity(
-        self,
-        entity_ids: Optional[Sequence[Any]] = None,
-        scope: str = "historical",
-        top_k: int = 10,
-        ncols: int = 2,
-        panel_size=(5.0, 3.5),
-    ):
-        """One feature-importance subplot per entity. Returns the Figure."""
-        eids = list(entity_ids) if entity_ids is not None else self.entities
-        fig, axes_used, _ = self._facet_grid(len(eids), ncols, panel_size)
-        for ax, eid in zip(axes_used, eids):
-            try:
-                self.plot_feature_importance(
-                    scope=scope, top_k=top_k, ax=ax, entity_ids=[eid]
-                )
-                ax.set_title(f"{eid}", fontsize=10)
-            except ValueError:
-                ax.set_axis_off()
-                ax.set_title(f"{eid} (no data)", fontsize=10)
-        fig.suptitle(
-            f"{scope.capitalize()} feature importance by entity",
-            fontsize=12, y=1.02,
-        )
-        fig.tight_layout()
-        return fig
-
-    def plot_attention_heatmap_by_entity(
-        self,
-        entity_ids: Optional[Sequence[Any]] = None,
-        layer: Optional[int] = None,
-        head: Optional[int | str] = "mean",
-        ncols: int = 2,
-        panel_size=(5.5, 3.5),
-        cmap: str = "viridis",
-        shared_scale: bool = True,
-    ):
-        """One attention-heatmap subplot per entity. Optionally shares a
-        single colour scale across panels for easier visual comparison."""
-        eids = list(entity_ids) if entity_ids is not None else self.entities
-        fig, axes_used, _ = self._facet_grid(len(eids), ncols, panel_size)
-
-        # Pre-compute per-entity matrices so we can find a shared vmin/vmax.
-        mats = []
-        for eid in eids:
-            try:
-                w = self.attention_by_horizon(
-                    layer=layer, head=head, entity_ids=[eid]
-                )
-                mats.append(w if not w.empty else None)
-            except ValueError:
-                mats.append(None)
-
-        if shared_scale:
-            vals = [m.values for m in mats if m is not None]
-            if vals:
-                vmin = float(min(v.min() for v in vals))
-                vmax = float(max(v.max() for v in vals))
-            else:
-                vmin = vmax = None
-        else:
-            vmin = vmax = None
-
-        last_im = None
-        for ax, eid, w in zip(axes_used, eids, mats):
-            if w is None:
-                ax.set_axis_off()
-                ax.set_title(f"{eid} (no attention data)", fontsize=10)
-                continue
-            im = ax.imshow(
-                w.values, aspect="auto", cmap=cmap, origin="lower",
-                vmin=vmin, vmax=vmax,
-            )
-            ax.set_xticks(range(w.shape[1]))
-            ax.set_xticklabels(w.columns)
-            ax.set_yticks(range(w.shape[0]))
-            ax.set_yticklabels(w.index)
-            ax.set_xlabel("Past lag (1 = most recent)")
-            ax.set_ylabel("Forecast horizon")
-            ax.set_title(f"{eid}", fontsize=10)
-            last_im = im
-
-        if shared_scale and last_im is not None:
-            fig.colorbar(last_im, ax=axes_used, label="attention weight",
-                         shrink=0.9)
-        elif last_im is not None:
-            # Per-panel colorbars when scales differ.
-            for ax, w in zip(axes_used, mats):
-                if w is None:
-                    continue
-                im = ax.images[0]
-                fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
-
-        fig.suptitle("Attention: horizon × past lag, by entity",
-                     fontsize=12, y=1.02)
-        fig.tight_layout()
-        return fig
-
-    def plot_temporal_importance_by_entity(
-        self,
-        entity_ids: Optional[Sequence[Any]] = None,
-        scope: str = "historical",
-        features: Optional[Sequence[str]] = None,
-        top_k: int = 5,
-        ncols: int = 2,
-        panel_size=(5.5, 3.0),
-    ):
-        """One temporal-importance subplot per entity."""
-        eids = list(entity_ids) if entity_ids is not None else self.entities
-        fig, axes_used, _ = self._facet_grid(len(eids), ncols, panel_size)
-
-        # If features wasn't given, use the global top_k for stability across
-        # panels — otherwise each panel could have a different feature set.
-        if features is None:
-            features = (
-                self.feature_importance(scope=scope).head(top_k)["feature"].tolist()
-            )
-
-        for ax, eid in zip(axes_used, eids):
-            try:
-                self.plot_temporal_importance(
-                    scope=scope, features=features, top_k=top_k,
-                    ax=ax, entity_ids=[eid],
-                )
-                ax.set_title(f"{eid}", fontsize=10)
-            except ValueError:
-                ax.set_axis_off()
-                ax.set_title(f"{eid} (no data)", fontsize=10)
-
-        fig.suptitle(
-            f"{scope.capitalize()} temporal importance by entity",
-            fontsize=12, y=1.02,
-        )
-        fig.tight_layout()
-        return fig
-
-    def plot_persistent_temporal_pattern_by_entity(
-        self,
-        entity_ids: Optional[Sequence[Any]] = None,
-        layer: Optional[int] = None,
-        head: Optional[int | str] = "mean",
-        ncols: int = 2,
-        panel_size=(5.5, 2.8),
-    ):
-        """One persistent-pattern subplot per entity — useful for comparing
-        seasonality across entities (e.g. lag-7 peak strength)."""
-        eids = list(entity_ids) if entity_ids is not None else self.entities
-        fig, axes_used, _ = self._facet_grid(len(eids), ncols, panel_size)
-        for ax, eid in zip(axes_used, eids):
-            try:
-                self.plot_persistent_temporal_pattern(
-                    ax=ax, entity_ids=[eid], layer=layer, head=head,
-                )
-                ax.set_title(f"{eid}", fontsize=10)
-            except ValueError:
-                ax.set_axis_off()
-                ax.set_title(f"{eid} (no data)", fontsize=10)
-        fig.suptitle("Persistent temporal pattern by entity",
-                     fontsize=12, y=1.02)
-        fig.tight_layout()
-        return fig
 
 
 def _import_matplotlib():
@@ -891,8 +542,7 @@ def _import_matplotlib():
         return plt
     except ImportError as e:
         raise ImportError(
-            "Plotting helpers require matplotlib. "
-            "Install with `pip install matplotlib`."
+            "Plotting helpers require matplotlib. Install with `pip install matplotlib`."
         ) from e
 
 
